@@ -74,3 +74,85 @@ task name: "downsample_sensor_data_to_1h" {
     |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
     |> to(bucket: hourly_bucket)
 }
+
+task name: "downsample_fiber_optic_to_5m" {
+  option task = {
+    name: "downsample_fiber_optic_to_5m",
+    every: 5m,
+    offset: 1m,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: raw_bucket)
+    |> range(start: -10m)
+    |> filter(fn: (r) => r._measurement == "fiber_optic")
+    |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+    |> set(key: "_field", value: "strain_mean")
+    |> to(bucket: five_min_bucket)
+}
+
+task name: "downsample_fiber_optic_max_to_5m" {
+  option task = {
+    name: "downsample_fiber_optic_max_to_5m",
+    every: 5m,
+    offset: 1m30s,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: raw_bucket)
+    |> range(start: -10m)
+    |> filter(fn: (r) => r._measurement == "fiber_optic")
+    |> aggregateWindow(every: 5m, fn: max, createEmpty: false)
+    |> set(key: "_field", value: "strain_max")
+    |> to(bucket: five_min_bucket)
+}
+
+task name: "downsample_gas_composition_to_5m" {
+  option task = {
+    name: "downsample_gas_composition_to_5m",
+    every: 5m,
+    offset: 2m,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: raw_bucket)
+    |> range(start: -10m)
+    |> filter(fn: (r) => r._measurement == "gas_composition")
+    |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+    |> to(bucket: five_min_bucket)
+}
+
+task name: "downsample_wobbe_index_to_5m" {
+  option task = {
+    name: "downsample_wobbe_index_to_5m",
+    every: 5m,
+    offset: 2m30s,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: raw_bucket)
+    |> range(start: -10m)
+    |> filter(fn: (r) => r._measurement == "wobbe_index")
+    |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+    |> to(bucket: five_min_bucket)
+}
+
+task name: "downsample_person_location_to_5m" {
+  option task = {
+    name: "downsample_person_location_to_5m",
+    every: 5m,
+    offset: 3m,
+    concurrency: 1,
+    retry: 3
+  }
+
+  from(bucket: raw_bucket)
+    |> range(start: -10m)
+    |> filter(fn: (r) => r._measurement == "person_location")
+    |> aggregateWindow(every: 5m, fn: last, createEmpty: false)
+    |> to(bucket: five_min_bucket)
+}

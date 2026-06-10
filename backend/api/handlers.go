@@ -506,7 +506,491 @@ func (h *Handler) Health(c *gin.Context) {
 			"alarm_router":         services.AlarmRouter != nil && services.AlarmRouter.IsRunning(),
 			"leak_locator":         services.LeakLocator != nil && services.LeakLocator.IsRunning(),
 			"emergency_controller": services.EmergencyController != nil && services.EmergencyController.IsRunning(),
+			"fiber_monitor":        services.FiberMonitor != nil && services.FiberMonitor.IsRunning(),
+			"corrosion_monitor":    services.CorrosionMonitor != nil && services.CorrosionMonitor.IsRunning(),
+			"calorific_control":    services.CalorificControl != nil && services.CalorificControl.IsRunning(),
+			"evacuation_planner":   services.EvacuationPlanner != nil && services.EvacuationPlanner.IsRunning(),
 		},
 	}
 	c.JSON(http.StatusOK, status)
+}
+
+func (h *Handler) GetStrainAnomalies(c *gin.Context) {
+	anomalies := services.DB.GetActiveStrainAnomalies()
+	c.JSON(http.StatusOK, anomalies)
+}
+
+func (h *Handler) GetFiberSensors(c *gin.Context) {
+	rows, err := services.DB.PG().Query(context.Background(), `
+		SELECT device_id, name, fiber_type, channel_number, start_position, end_position, status, health
+		FROM fiber_optic_sensors
+		ORDER BY channel_number
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var sensors []gin.H
+	for rows.Next() {
+		var s struct {
+			DeviceID       string  `json:"device_id"`
+			Name           string  `json:"name"`
+			FiberType      string  `json:"fiber_type"`
+			ChannelNumber  int     `json:"channel_number"`
+			StartPosition  float64 `json:"start_position"`
+			EndPosition    float64 `json:"end_position"`
+			Status         string  `json:"status"`
+			Health         float64 `json:"health"`
+		}
+		err := rows.Scan(&s.DeviceID, &s.Name, &s.FiberType, &s.ChannelNumber,
+			&s.StartPosition, &s.EndPosition, &s.Status, &s.Health)
+		if err != nil {
+			continue
+		}
+		sensors = append(sensors, gin.H{
+			"device_id":       s.DeviceID,
+			"name":            s.Name,
+			"fiber_type":      s.FiberType,
+			"channel_number":  s.ChannelNumber,
+			"start_position":  s.StartPosition,
+			"end_position":    s.EndPosition,
+			"status":          s.Status,
+			"health":          s.Health,
+		})
+	}
+
+	c.JSON(http.StatusOK, sensors)
+}
+
+func (h *Handler) ReceiveFiberData(c *gin.Context) {
+	var data models.FiberOpticData
+	if err := c.ShouldBindJSON(&data); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if services.FiberMonitor != nil {
+		services.FiberMonitor.ProcessFiberData(&data)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "received"})
+}
+
+func (h *Handler) ResolveStrainAnomaly(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid anomaly id"})
+		return
+	}
+
+	_, err = services.DB.PG().Exec(context.Background(), `
+		UPDATE strain_anomalies
+		SET resolved = TRUE, resolved_at = NOW(), resolved_note = $1
+		WHERE id = $2
+	`, c.PostForm("note"), id)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "resolved"})
+}
+
+func (h *Handler) GetCorrosionPipes(c *gin.Context) {
+	rows, err := services.DB.PG().Query(context.Background(), `
+		SELECT pipe_id, name, diameter, material, original_wall_thickness,
+			start_position, end_position, status
+		FROM pipes
+		ORDER BY start_position
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var pipes []gin.H
+	for rows.Next() {
+		var p struct {
+			PipeID               string  `json:"pipe_id"`
+			Name                 string  `json:"name"`
+			Diameter             float64 `json:"diameter"`
+			Material             string  `json:"material"`
+			OriginalWallThickness float64 `json:"original_wall_thickness"`
+			StartPosition        float64 `json:"start_position"`
+			EndPosition          float64 `json:"end_position"`
+			Status               string  `json:"status"`
+		}
+		err := rows.Scan(&p.PipeID, &p.Name, &p.Diameter, &p.Material,
+			&p.OriginalWallThickness, &p.StartPosition, &p.EndPosition, &p.Status)
+		if err != nil {
+			continue
+		}
+		pipes = append(pipes, gin.H{
+			"pipe_id":                 p.PipeID,
+			"name":                    p.Name,
+			"diameter":                p.Diameter,
+			"material":                p.Material,
+			"original_wall_thickness": p.OriginalWallThickness,
+			"start_position":          p.StartPosition,
+			"end_position":            p.EndPosition,
+			"status":                  p.Status,
+		})
+	}
+
+	c.JSON(http.StatusOK, pipes)
+}
+
+func (h *Handler) GetCorrosionData(c *gin.Context) {
+	pipeID := c.Query("pipe_id")
+
+	query := `
+		SELECT id, pipe_id, position, latitude, longitude,
+			original_wall_thickness, current_wall_thickness, inspection_date,
+			corrosion_rate, predicted_rate, remaining_life_years, replacement_priority, next_inspection_date
+		FROM pipe_corrosion_data
+	`
+	var args []interface{}
+	if pipeID != "" {
+		query += ` WHERE pipe_id = $1`
+		args = append(args, pipeID)
+	}
+	query += ` ORDER BY inspection_date DESC LIMIT 100`
+
+	rows, err := services.DB.PG().Query(context.Background(), query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var data []*models.PipeCorrosionData
+	for rows.Next() {
+		d := &models.PipeCorrosionData{}
+		err := rows.Scan(&d.ID, &d.PipeID, &d.Position, &d.Latitude, &d.Longitude,
+			&d.OriginalWallThickness, &d.CurrentWallThickness, &d.InspectionDate,
+			&d.CorrosionRate, &d.PredictedRate, &d.RemainingLife,
+			&d.ReplacementPriority, &d.NextInspectionDate)
+		if err != nil {
+			continue
+		}
+		data = append(data, d)
+	}
+
+	c.JSON(http.StatusOK, data)
+}
+
+func (h *Handler) GetHighPriorityPipes(c *gin.Context) {
+	pipes := services.DB.GetHighPriorityPipes()
+	c.JSON(http.StatusOK, pipes)
+}
+
+func (h *Handler) GetCorrosionPredictions(c *gin.Context) {
+	predictions := services.DB.GetRecentCorrosionPredictions(50)
+	c.JSON(http.StatusOK, predictions)
+}
+
+func (h *Handler) AddCorrosionInspection(c *gin.Context) {
+	var data models.PipeCorrosionData
+	if err := c.ShouldBindJSON(&data); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	data.ID = uuid.New()
+	if data.InspectionDate.IsZero() {
+		data.InspectionDate = time.Now()
+	}
+
+	if services.CorrosionMonitor != nil {
+		services.CorrosionMonitor.ProcessInspectionData(&data)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "received", "id": data.ID})
+}
+
+func (h *Handler) GetWobbeIndices(c *gin.Context) {
+	rows, err := services.DB.PG().Query(context.Background(), `
+		SELECT device_id, timestamp, high_heating_value, low_heating_value,
+			relative_density, wobbe_index_high, wobbe_index_low, burning_velocity,
+			status, target_wobbe, deviation
+		FROM wobbe_indices
+		ORDER BY timestamp DESC
+		LIMIT 100
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var data []*models.WobbeIndex
+	for rows.Next() {
+		w := &models.WobbeIndex{}
+		err := rows.Scan(&w.DeviceID, &w.Timestamp, &w.HighHeatingValue, &w.LowHeatingValue,
+			&w.RelativeDensity, &w.WobbeIndexHigh, &w.WobbeIndexLow, &w.BurningVelocity,
+			&w.Status, &w.TargetWobbe, &w.Deviation)
+		if err != nil {
+			continue
+		}
+		data = append(data, w)
+	}
+
+	c.JSON(http.StatusOK, data)
+}
+
+func (h *Handler) GetGasAnalyzers(c *gin.Context) {
+	rows, err := services.DB.PG().Query(context.Background(), `
+		SELECT device_id, name, position, latitude, longitude, status, health
+		FROM gas_analyzers
+		ORDER BY position
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var analyzers []gin.H
+	for rows.Next() {
+		var a struct {
+			DeviceID   string  `json:"device_id"`
+			Name       string  `json:"name"`
+			Position   float64 `json:"position"`
+			Latitude   float64 `json:"latitude"`
+			Longitude  float64 `json:"longitude"`
+			Status     string  `json:"status"`
+			Health     float64 `json:"health"`
+		}
+		err := rows.Scan(&a.DeviceID, &a.Name, &a.Position, &a.Latitude,
+			&a.Longitude, &a.Status, &a.Health)
+		if err != nil {
+			continue
+		}
+		analyzers = append(analyzers, gin.H{
+			"device_id": a.DeviceID,
+			"name":      a.Name,
+			"position":  a.Position,
+			"latitude":  a.Latitude,
+			"longitude": a.Longitude,
+			"status":    a.Status,
+			"health":    a.Health,
+		})
+	}
+
+	c.JSON(http.StatusOK, analyzers)
+}
+
+func (h *Handler) GetGasValves(c *gin.Context) {
+	if services.CalorificControl != nil {
+		valves := services.CalorificControl.GetAllValveStates()
+		c.JSON(http.StatusOK, valves)
+		return
+	}
+
+	rows, err := services.DB.PG().Query(context.Background(), `
+		SELECT valve_id, name, source_type, current_opening, target_opening, status
+		FROM gas_mixing_valves
+		ORDER BY source_type
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var valves []gin.H
+	for rows.Next() {
+		var v struct {
+			ValveID       string  `json:"valve_id"`
+			Name          string  `json:"name"`
+			SourceType    string  `json:"source_type"`
+			CurrentOpening float64 `json:"current_opening"`
+			TargetOpening  float64 `json:"target_opening"`
+			Status        string  `json:"status"`
+		}
+		err := rows.Scan(&v.ValveID, &v.Name, &v.SourceType, &v.CurrentOpening,
+			&v.TargetOpening, &v.Status)
+		if err != nil {
+			continue
+		}
+		valves = append(valves, gin.H{
+			"valve_id":       v.ValveID,
+			"name":           v.Name,
+			"source_type":    v.SourceType,
+			"current_opening": v.CurrentOpening,
+			"target_opening":  v.TargetOpening,
+			"status":         v.Status,
+		})
+	}
+
+	c.JSON(http.StatusOK, valves)
+}
+
+func (h *Handler) ReceiveGasComposition(c *gin.Context) {
+	var data models.GasComposition
+	if err := c.ShouldBindJSON(&data); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if data.Timestamp.IsZero() {
+		data.Timestamp = time.Now()
+	}
+
+	if services.CalorificControl != nil {
+		services.CalorificControl.ProcessCompositionData(&data)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "received"})
+}
+
+func (h *Handler) ControlGasValve(c *gin.Context) {
+	valveID := c.Param("id")
+
+	var req struct {
+		TargetOpening float64 `json:"target_opening" binding:"required,min=0,max=100"`
+		Reason        string  `json:"reason"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if services.CalorificControl != nil {
+		current := services.CalorificControl.GetValveState(valveID)
+		control := &models.GasValveControl{
+			ID:            uuid.New(),
+			ValveID:       valveID,
+			Opening:       current,
+			TargetOpening: req.TargetOpening,
+			Adjustment:    req.TargetOpening - current,
+			Reason:        req.Reason,
+			Timestamp:     time.Now(),
+			Success:       true,
+		}
+
+		if control.SourceType == "" {
+			control.SourceType = "manual"
+		}
+
+		services.DB.SaveGasValveControl(control)
+		services.CalorificControl.SetValveState(valveID, req.TargetOpening)
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":         "adjusted",
+			"valve_id":       valveID,
+			"current_opening": req.TargetOpening,
+			"adjustment":     control.Adjustment,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) GetEvacuationRoutes(c *gin.Context) {
+	routes := services.EvacuationPlanner.GetActiveRoutes()
+	c.JSON(http.StatusOK, routes)
+}
+
+func (h *Handler) GetExitPoints(c *gin.Context) {
+	exits, err := services.DB.GetExitPoints()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, exits)
+}
+
+func (h *Handler) GetPeopleLocations(c *gin.Context) {
+	people := services.EvacuationPlanner.GetAllPeople()
+	c.JSON(http.StatusOK, people)
+}
+
+func (h *Handler) GetBroadcastMessages(c *gin.Context) {
+	rows, err := services.DB.PG().Query(context.Background(), `
+		SELECT id, fire_zone, message, message_type, priority, timestamp, broadcasted
+		FROM broadcast_messages
+		ORDER BY timestamp DESC
+		LIMIT 100
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var messages []*models.BroadcastMessage
+	for rows.Next() {
+		m := &models.BroadcastMessage{}
+		err := rows.Scan(&m.ID, &m.FireZone, &m.Message, &m.MessageType,
+			&m.Priority, &m.Timestamp, &m.Broadcasted)
+		if err != nil {
+			continue
+		}
+		messages = append(messages, m)
+	}
+
+	c.JSON(http.StatusOK, messages)
+}
+
+func (h *Handler) UpdatePersonLocation(c *gin.Context) {
+	var person models.PersonLocation
+	if err := c.ShouldBindJSON(&person); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if person.Timestamp.IsZero() {
+		person.Timestamp = time.Now()
+	}
+
+	if services.EvacuationPlanner != nil {
+		services.EvacuationPlanner.UpdatePersonLocation(&person)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "updated"})
+}
+
+func (h *Handler) TriggerEvacuation(c *gin.Context) {
+	var req struct {
+		FireZone string `json:"fire_zone" binding:"required"`
+		DeviceID string `json:"device_id"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if services.EvacuationPlanner != nil {
+		alarm := &models.Alarm{
+			ID:       uuid.New(),
+			DeviceID: req.DeviceID,
+			Level:    3,
+			Message:  "手动触发紧急疏散",
+		}
+
+		if services.AlarmRouter != nil {
+			select {
+			case alarmChan := <-make(chan *models.Alarm, 1):
+				alarmChan = alarm
+			default:
+			}
+		}
+
+		if services.AlarmRouter != nil {
+			alarmDataChan := make(chan *models.Alarm, 1)
+			alarmDataChan <- alarm
+			close(alarmDataChan)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "evacuation_triggered", "fire_zone": req.FireZone})
 }

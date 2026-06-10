@@ -43,6 +43,22 @@
                         <div class="stat-value" id="stat-max-concentration">0.00%LEL</div>
                         <div class="stat-label">最高浓度</div>
                     </div>
+                    <div class="stat-item" style="border-left: 2px solid #ff6b6b;">
+                        <div class="stat-value" id="stat-fiber-anomalies">0</div>
+                        <div class="stat-label">结构异常</div>
+                    </div>
+                    <div class="stat-item" style="border-left: 2px solid #ffa500;">
+                        <div class="stat-value" id="stat-high-priority-pipes">0</div>
+                        <div class="stat-label">高危管段</div>
+                    </div>
+                    <div class="stat-item" style="border-left: 2px solid #4ecdc4;">
+                        <div class="stat-value" id="stat-wobbe-index">--</div>
+                        <div class="stat-label">华白数</div>
+                    </div>
+                    <div class="stat-item" style="border-left: 2px solid #e74c3c;">
+                        <div class="stat-value" id="stat-active-people">0</div>
+                        <div class="stat-label">管廊人员</div>
+                    </div>
                 </div>
                 <div class="connection-status">
                     <span id="ws-status" class="status-dot disconnected" title="WebSocket连接状态"></span>
@@ -61,6 +77,10 @@
                         <button id="btn-toggle-heatmap" class="control-btn">隐藏热力图</button>
                         <button id="btn-toggle-valves" class="control-btn">隐藏阀门</button>
                         <button id="btn-toggle-leaks" class="control-btn">隐藏泄漏源</button>
+                        <button id="btn-toggle-fiber" class="control-btn active">光纤监测</button>
+                        <button id="btn-toggle-corrosion" class="control-btn active">腐蚀预测</button>
+                        <button id="btn-toggle-calorific" class="control-btn active">热值调节</button>
+                        <button id="btn-toggle-evacuation" class="control-btn active">疏散路径</button>
                     </div>
                     <div class="control-group">
                         <label>浓度阈值 (%LEL)</label>
@@ -117,12 +137,196 @@
                             <div class="legend-circle" style="border-color: #ff0000;"></div>
                             <span>泄漏扩散范围</span>
                         </div>
+                        <div class="legend-item">
+                            <div class="legend-line" style="background: #ff0000; border: 2px dashed #ff0000;"></div>
+                            <span>应变异常区</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #ffa500;"></div>
+                            <span>高危管段</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-line" style="background: #00ff00; border: 3px solid #00ff00;"></div>
+                            <span>疏散路径</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #4ecdc4;"></div>
+                            <span>气体分析仪</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #e74c3c;"></div>
+                            <span>管廊人员</span>
+                        </div>
+                        <div class="legend-item">
+                            <div class="legend-color" style="background: #27ae60;"></div>
+                            <span>安全出口</span>
+                        </div>
                     </div>
                 </div>
             </aside>
 
             <main class="content">
-                <div id="map"></div>
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="map">管廊地图</button>
+                    <button class="tab-btn" data-tab="fiber">结构健康</button>
+                    <button class="tab-btn" data-tab="corrosion">腐蚀预测</button>
+                    <button class="tab-btn" data-tab="calorific">热值调节</button>
+                    <button class="tab-btn" data-tab="evacuation">应急疏散</button>
+                </div>
+                <div class="tab-content active" id="tab-map">
+                    <div id="map"></div>
+                </div>
+                <div class="tab-content" id="tab-fiber">
+                    <div class="panel-content">
+                        <h2>管廊结构健康监测</h2>
+                        <div class="stats-row">
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="fiber-active-anomalies">0</div>
+                                <div class="stat-card-label">活动异常</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="fiber-total-sensors">0</div>
+                                <div class="stat-card-label">光纤传感器</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="fiber-monitor-status">正常</div>
+                                <div class="stat-card-label">监测状态</div>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <h3>应变异常记录</h3>
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>位置(m)</th>
+                                        <th>应变(με)</th>
+                                        <th>温度(°C)</th>
+                                        <th>置信度</th>
+                                        <th>状态</th>
+                                        <th>时间</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="fiber-anomalies-table">
+                                    <tr><td colspan="7" class="no-data">暂无异常记录</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="tab-content" id="tab-corrosion">
+                    <div class="panel-content">
+                        <h2>燃气管道腐蚀预测</h2>
+                        <div class="stats-row">
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="corrosion-high-priority">0</div>
+                                <div class="stat-card-label">需更换管段</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="corrosion-total-pipes">0</div>
+                                <div class="stat-card-label">监测管段</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="corrosion-avg-rate">--</div>
+                                <div class="stat-card-label">平均腐蚀速率(mm/年)</div>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <h3>高优先级管段</h3>
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>管段ID</th>
+                                        <th>位置(m)</th>
+                                        <th>剩余壁厚(mm)</th>
+                                        <th>腐蚀速率(mm/年)</th>
+                                        <th>剩余寿命(年)</th>
+                                        <th>优先级</th>
+                                        <th>建议</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="corrosion-pipes-table">
+                                    <tr><td colspan="7" class="no-data">暂无高优先级管段</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="tab-content" id="tab-calorific">
+                    <div class="panel-content">
+                        <h2>多气源混输热值调节</h2>
+                        <div class="stats-row">
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="calorific-current-wobbe">--</div>
+                                <div class="stat-card-label">当前华白数(MJ/m³)</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="calorific-target-wobbe">48.0</div>
+                                <div class="stat-card-label">目标华白数(MJ/m³)</div>
+                            </div>
+                            <div class="stat-card" id="calorific-status-card">
+                                <div class="stat-card-value" id="calorific-status">稳定</div>
+                                <div class="stat-card-label">调节状态</div>
+                            </div>
+                        </div>
+                        <div class="gas-composition">
+                            <h3>气体组分分析</h3>
+                            <div id="gas-composition-chart" class="composition-chart"></div>
+                        </div>
+                        <div class="valve-control">
+                            <h3>混气阀控制</h3>
+                            <div class="valve-list" id="gas-valves-list">
+                                <div class="no-data">暂无阀门数据</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="tab-content" id="tab-evacuation">
+                    <div class="panel-content">
+                        <h2>应急疏散路径规划</h2>
+                        <div class="stats-row">
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="evacuation-active-routes">0</div>
+                                <div class="stat-card-label">活动疏散路径</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="evacuation-people">0</div>
+                                <div class="stat-card-label">需疏散人员</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-card-value" id="evacuation-exits">0</div>
+                                <div class="stat-card-label">可用出口</div>
+                            </div>
+                        </div>
+                        <div class="evacuation-actions">
+                            <button id="btn-trigger-evacuation" class="control-btn danger">手动触发疏散</button>
+                        </div>
+                        <div class="table-container">
+                            <h3>疏散路径</h3>
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>人员ID</th>
+                                        <th>当前位置(m)</th>
+                                        <th>目标出口</th>
+                                        <th>距离(m)</th>
+                                        <th>预计时间(分钟)</th>
+                                        <th>状态</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="evacuation-routes-table">
+                                    <tr><td colspan="6" class="no-data">暂无疏散任务</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="broadcast-messages">
+                            <h3>广播消息</h3>
+                            <div id="broadcast-list" class="broadcast-list">
+                                <div class="no-data">暂无广播消息</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </main>
         </div>
 
@@ -206,6 +410,10 @@
     <script src="/static/js/heatmap.js"></script>
     <script src="/static/js/chart.js"></script>
     <script src="/static/js/websocket.js"></script>
+    <script src="/static/js/fiber_monitor.js"></script>
+    <script src="/static/js/corrosion_monitor.js"></script>
+    <script src="/static/js/calorific_control.js"></script>
+    <script src="/static/js/evacuation_planner.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>

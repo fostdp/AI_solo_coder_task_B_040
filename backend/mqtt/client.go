@@ -128,6 +128,21 @@ func (m *MQTTService) subscribeTopics() {
 	token := m.client.Subscribe(confirmTopic, 1, m.handleDeviceStatus)
 	token.Wait()
 	log.Printf("Subscribed to device status topic: %s", confirmTopic)
+
+	fiberTopic := "sensors/fiber/+/data"
+	token = m.client.Subscribe(fiberTopic, 1, m.handleFiberData)
+	token.Wait()
+	log.Printf("Subscribed to fiber optic data topic: %s", fiberTopic)
+
+	compositionTopic := "sensors/gas-analyzer/+/data"
+	token = m.client.Subscribe(compositionTopic, 1, m.handleCompositionData)
+	token.Wait()
+	log.Printf("Subscribed to gas composition topic: %s", compositionTopic)
+
+	personTopic := "tracking/person/+/location"
+	token = m.client.Subscribe(personTopic, 1, m.handlePersonLocation)
+	token.Wait()
+	log.Printf("Subscribed to person location topic: %s", personTopic)
 }
 
 func (m *MQTTService) startRetryLoop() {
@@ -378,6 +393,58 @@ func (m *MQTTService) handleCommand(client mqtt.Client, msg mqtt.Message) {
 	log.Printf("Received command on %s: %s", msg.Topic(), string(msg.Payload()))
 }
 
+func (m *MQTTService) handleFiberData(client mqtt.Client, msg mqtt.Message) {
+	var data models.FiberOpticData
+	if err := json.Unmarshal(msg.Payload(), &data); err != nil {
+		log.Printf("Failed to parse fiber data: %v", err)
+		return
+	}
+
+	if data.Timestamp.IsZero() {
+		data.Timestamp = time.Now()
+	}
+
+	if services.FiberMonitor != nil {
+		go services.FiberMonitor.ProcessFiberData(&data)
+	}
+}
+
+func (m *MQTTService) handleCompositionData(client mqtt.Client, msg mqtt.Message) {
+	var data models.GasComposition
+	if err := json.Unmarshal(msg.Payload(), &data); err != nil {
+		log.Printf("Failed to parse gas composition: %v", err)
+		return
+	}
+
+	if data.Timestamp.IsZero() {
+		data.Timestamp = time.Now()
+	}
+
+	if services.CalorificControl != nil {
+		go services.CalorificControl.ProcessCompositionData(&data)
+	}
+}
+
+func (m *MQTTService) handlePersonLocation(client mqtt.Client, msg mqtt.Message) {
+	var data models.PersonLocation
+	if err := json.Unmarshal(msg.Payload(), &data); err != nil {
+		log.Printf("Failed to parse person location: %v", err)
+		return
+	}
+
+	if data.Timestamp.IsZero() {
+		data.Timestamp = time.Now()
+	}
+
+	if services.EvacuationPlanner != nil {
+		go services.EvacuationPlanner.UpdatePersonLocation(&data)
+	}
+
+	if services.DB != nil {
+		go services.DB.SavePersonLocation(&data)
+	}
+}
+
 func (m *MQTTService) Publish(topic string, payload interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -471,6 +538,43 @@ func (m *MQTTService) SendNotification(message string, level int) error {
 		"timestamp": time.Now(),
 	}
 	return m.Publish(topic, payload)
+}
+
+func (m *MQTTService) SendBroadcastMessage(msg *models.BroadcastMessage) error {
+	topic := fmt.Sprintf("broadcast/%s", msg.FireZone)
+	payload := map[string]interface{}{
+		"id":           msg.ID,
+		"fire_zone":    msg.FireZone,
+		"message":      msg.Message,
+		"message_type": msg.MessageType,
+		"priority":     msg.Priority,
+		"timestamp":    msg.Timestamp,
+	}
+	return m.Publish(topic, payload)
+}
+
+func (m *MQTTService) ControlGasValve(valveID string, targetOpening float64, reason string) error {
+	topic := fmt.Sprintf("gas_valves/%s/control", valveID)
+	payload := map[string]interface{}{
+		"valve_id":        valveID,
+		"target_opening":  targetOpening,
+		"reason":          reason,
+		"timestamp":       time.Now(),
+	}
+
+	onConfirm := func() {
+		log.Printf("[GAS-VALVE] Gas valve %s control confirmed, target opening: %.1f%%", valveID, targetOpening)
+	}
+
+	onTimeout := func() {
+		log.Printf("[GAS-VALVE] Gas valve %s control timeout", valveID)
+	}
+
+	onError := func(err error) {
+		log.Printf("[GAS-VALVE] Gas valve %s control failed: %v", valveID, err)
+	}
+
+	return m.SendReliableCommand("gas_valve", valveID, "set_opening", topic, payload, onConfirm, onTimeout, onError)
 }
 
 func (m *MQTTService) Close() {

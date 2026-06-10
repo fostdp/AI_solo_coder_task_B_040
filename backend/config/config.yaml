@@ -99,3 +99,49 @@ alarm_router:
   sms_min_level: 1
   sms_interval: 15m
   sms_max_per_interval: 3
+
+fiber_monitor:
+  fiber_count: 10
+  sensing_interval: 10s
+  spatial_resolution: 1.0
+  strain_warning_threshold: 500.0
+  strain_alarm_threshold: 1000.0
+  temperature_warning_threshold: 50.0
+  temperature_alarm_threshold: 80.0
+  brillouin_coefficient: 0.05
+  anomaly_merge_distance: 10.0
+  stats_interval: 60s
+
+corrosion_monitor:
+  inspection_interval: 24h
+  min_wall_thickness: 8.0
+  critical_wall_thickness: 5.0
+  prediction_horizon_months: 60
+  grey_model_order: 1
+  exponential_decay_rate: 0.02
+  replacement_threshold: 0.7
+  high_priority_rate: 0.5
+  medium_priority_rate: 0.3
+  stats_interval: 60s
+
+calorific_control:
+  analyzer_count: 3
+  analysis_interval: 5s
+  target_wobbe_index: 48.0
+  wobbe_tolerance: 1.0
+  max_valve_adjustment: 5.0
+  valve_cooldown: 30s
+  methane_source_name: "source-a"
+  hydrogen_source_name: "source-b"
+  natural_gas_source_name: "source-c"
+  stats_interval: 60s
+
+evacuation_planner:
+  planning_interval: 1s
+  person_speed_meters_per_min: 60.0
+  max_route_age_seconds: 10
+  min_exit_distance: 50.0
+  broadcast_repeat_count: 3
+  broadcast_interval: 10s
+  graph_update_interval: 60s
+  stats_interval: 60s

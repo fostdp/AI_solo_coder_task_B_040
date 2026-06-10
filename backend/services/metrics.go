@@ -142,6 +142,133 @@ var (
 			return time.Since(StartTime).Seconds()
 		},
 	)
+
+	StrainGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_strain_microstrain",
+			Help: "Current strain measurement from fiber optic sensors",
+		},
+		[]string{"sensor_id", "position"},
+	)
+
+	TemperatureGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_temperature_celsius",
+			Help: "Current temperature measurement from fiber optic sensors",
+		},
+		[]string{"sensor_id", "position"},
+	)
+
+	StrainAnomaliesActive = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_strain_anomalies_active",
+			Help: "Number of currently active strain anomalies",
+		},
+	)
+
+	StrainAnomaliesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gas_monitoring_strain_anomalies_total",
+			Help: "Total number of strain anomalies detected",
+		},
+		[]string{"anomaly_type", "severity"},
+	)
+
+	WallThicknessGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_wall_thickness_mm",
+			Help: "Current pipe wall thickness measurement",
+		},
+		[]string{"pipe_id", "priority"},
+	)
+
+	CorrosionRateGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_corrosion_rate_mm_per_year",
+			Help: "Predicted corrosion rate for pipes",
+		},
+		[]string{"pipe_id", "model"},
+	)
+
+	HighPriorityPipes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_high_priority_pipes",
+			Help: "Number of pipes requiring replacement",
+		},
+	)
+
+	CorrosionPredictionsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gas_monitoring_corrosion_predictions_total",
+			Help: "Total number of corrosion predictions made",
+		},
+	)
+
+	WobbeIndexGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_wobbe_index_mj_per_m3",
+			Help: "Current Wobbe index of gas mixture",
+		},
+	)
+
+	GasCompositionGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_gas_composition_fraction",
+			Help: "Gas composition fraction for each component",
+		},
+		[]string{"component", "analyzer_id"},
+	)
+
+	ValvePositionGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_valve_position_percent",
+			Help: "Current gas mixing valve opening position",
+		},
+		[]string{"valve_id"},
+	)
+
+	ValveAdjustmentsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gas_monitoring_valve_adjustments_total",
+			Help: "Total number of valve adjustments made",
+		},
+	)
+
+	ActivePeopleGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_active_people_in_corridor",
+			Help: "Number of people currently in the corridor",
+		},
+	)
+
+	EvacuationRoutesActive = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_evacuation_routes_active",
+			Help: "Number of active evacuation routes",
+		},
+	)
+
+	EvacuationRoutesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gas_monitoring_evacuation_routes_total",
+			Help: "Total number of evacuation routes calculated",
+		},
+	)
+
+	BroadcastMessagesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gas_monitoring_broadcast_messages_total",
+			Help: "Total number of broadcast messages sent",
+		},
+		[]string{"level"},
+	)
+
+	ExitPointsAvailable = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gas_monitoring_exit_points_available",
+			Help: "Number of available exit points",
+		},
+	)
 )
 
 func InitMetrics() {
@@ -165,6 +292,23 @@ func InitMetrics() {
 			HTTPRequestDuration,
 			WebSocketConnections,
 			SystemUptime,
+			StrainGauge,
+			TemperatureGauge,
+			StrainAnomaliesActive,
+			StrainAnomaliesTotal,
+			WallThicknessGauge,
+			CorrosionRateGauge,
+			HighPriorityPipes,
+			CorrosionPredictionsTotal,
+			WobbeIndexGauge,
+			GasCompositionGauge,
+			ValvePositionGauge,
+			ValveAdjustmentsTotal,
+			ActivePeopleGauge,
+			EvacuationRoutesActive,
+			EvacuationRoutesTotal,
+			BroadcastMessagesTotal,
+			ExitPointsAvailable,
 		)
 	})
 }

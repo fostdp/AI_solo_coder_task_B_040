@@ -111,3 +111,162 @@ type HealthStatus struct {
 	Voltage     float64 `json:"voltage"`
 	Signal      float64 `json:"signal_strength"`
 }
+
+type FiberOpticData struct {
+	DeviceID     string    `json:"device_id"`
+	Position     float64   `json:"position"`
+	Timestamp    time.Time `json:"timestamp"`
+	Strain       float64   `json:"strain"`
+	Temperature  float64   `json:"temperature"`
+	BrillouinShift float64 `json:"brillouin_shift"`
+	Status       string    `json:"status"`
+}
+
+type StrainAnomaly struct {
+	ID          uuid.UUID `json:"id"`
+	Position    float64   `json:"position"`
+	Latitude    float64   `json:"latitude"`
+	Longitude   float64   `json:"longitude"`
+	Length      float64   `json:"length"`
+	MaxStrain   float64   `json:"max_strain"`
+	AvgStrain   float64   `json:"avg_strain"`
+	Temperature float64   `json:"temperature"`
+	Confidence  float64   `json:"confidence"`
+	Type        string    `json:"type"`
+	Severity    string    `json:"severity"`
+	DetectedAt  time.Time `json:"detected_at"`
+	Resolved    bool      `json:"resolved"`
+}
+
+type PipeCorrosionData struct {
+	ID          uuid.UUID `json:"id"`
+	PipeID      string    `json:"pipe_id"`
+	Position    float64   `json:"position"`
+	Latitude    float64   `json:"latitude"`
+	Longitude   float64   `json:"longitude"`
+	OriginalWallThickness float64 `json:"original_wall_thickness"`
+	CurrentWallThickness  float64 `json:"current_wall_thickness"`
+	InspectionDate time.Time `json:"inspection_date"`
+	CorrosionRate float64   `json:"corrosion_rate"`
+	PredictedRate float64   `json:"predicted_rate"`
+	RemainingLife float64   `json:"remaining_life_years"`
+	ReplacementPriority string `json:"replacement_priority"`
+	NextInspectionDate time.Time `json:"next_inspection_date"`
+}
+
+type CorrosionPrediction struct {
+	ID           uuid.UUID `json:"id"`
+	PipeID       string    `json:"pipe_id"`
+	PredictionDate time.Time `json:"prediction_date"`
+	Model        string    `json:"model"`
+	PredictedThickness []float64 `json:"predicted_thickness"`
+	TimeHorizonMonths []int `json:"time_horizon_months"`
+	Confidence   float64   `json:"confidence"`
+}
+
+type GasComposition struct {
+	DeviceID    string    `json:"device_id"`
+	Timestamp   time.Time `json:"timestamp"`
+	Methane     float64   `json:"methane"`
+	Ethane      float64   `json:"ethane"`
+	Propane     float64   `json:"propane"`
+	Butane      float64   `json:"butane"`
+	Nitrogen    float64   `json:"nitrogen"`
+	CarbonDioxide float64 `json:"carbon_dioxide"`
+	Hydrogen    float64   `json:"hydrogen"`
+}
+
+type WobbeIndex struct {
+	DeviceID      string    `json:"device_id"`
+	Timestamp     time.Time `json:"timestamp"`
+	HighHeatingValue float64 `json:"high_heating_value"`
+	LowHeatingValue  float64 `json:"low_heating_value"`
+	RelativeDensity float64 `json:"relative_density"`
+	WobbeIndexHigh float64   `json:"wobbe_index_high"`
+	WobbeIndexLow  float64   `json:"wobbe_index_low"`
+	BurningVelocity float64  `json:"burning_velocity"`
+	Status        string    `json:"status"`
+	TargetWobbe   float64   `json:"target_wobbe"`
+	Deviation     float64   `json:"deviation"`
+}
+
+type GasValveControl struct {
+	ID          uuid.UUID `json:"id"`
+	ValveID     string    `json:"valve_id"`
+	SourceType  string    `json:"source_type"`
+	Opening     float64   `json:"opening"`
+	TargetOpening float64  `json:"target_opening"`
+	Adjustment  float64   `json:"adjustment"`
+	Reason      string    `json:"reason"`
+	Timestamp   time.Time `json:"timestamp"`
+	Success     bool      `json:"success"`
+}
+
+type EvacuationRoute struct {
+	ID          uuid.UUID `json:"id"`
+	AlarmID     uuid.UUID `json:"alarm_id"`
+	FireZone    string    `json:"fire_zone"`
+	CalculatedAt time.Time `json:"calculated_at"`
+	Path        []RouteNode `json:"path"`
+	TotalDistance float64   `json:"total_distance"`
+	EstimatedTime float64   `json:"estimated_time_minutes"`
+	ExitPoints  []ExitPoint `json:"exit_points"`
+	BlockedSegments []string `json:"blocked_segments"`
+	Status      string    `json:"status"`
+}
+
+type RouteNode struct {
+	Position    float64   `json:"position"`
+	Latitude    float64   `json:"latitude"`
+	Longitude   float64   `json:"longitude"`
+	NodeType    string    `json:"node_type"`
+	Name        string    `json:"name"`
+}
+
+type ExitPoint struct {
+	ID          string    `json:"id"`
+	Position    float64   `json:"position"`
+	Latitude    float64   `json:"latitude"`
+	Longitude   float64   `json:"longitude"`
+	Name        string    `json:"name"`
+	Status      string    `json:"status"`
+	Capacity    int       `json:"capacity"`
+}
+
+type PersonLocation struct {
+	PersonID    string    `json:"person_id"`
+	Position    float64   `json:"position"`
+	Latitude    float64   `json:"latitude"`
+	Longitude   float64   `json:"longitude"`
+	FireZone    string    `json:"fire_zone"`
+	Timestamp   time.Time `json:"timestamp"`
+	Status      string    `json:"status"`
+	AssignedRoute uuid.UUID `json:"assigned_route,omitempty"`
+}
+
+type BroadcastMessage struct {
+	ID          uuid.UUID `json:"id"`
+	FireZone    string    `json:"fire_zone"`
+	Message     string    `json:"message"`
+	MessageType string    `json:"message_type"`
+	Priority    int       `json:"priority"`
+	Timestamp   time.Time `json:"timestamp"`
+	Broadcasted bool      `json:"broadcasted"`
+}
+
+type GraphNode struct {
+	ID       string
+	Position float64
+	Lat      float64
+	Lng      float64
+	Name     string
+	Type     string
+}
+
+type GraphEdge struct {
+	From     string
+	To       string
+	Distance float64
+	Weight   float64
+	Blocked  bool
+}

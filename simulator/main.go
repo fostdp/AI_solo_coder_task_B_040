@@ -37,18 +37,115 @@ type LeakSource struct {
 	Enabled  bool    `json:"enabled"`
 }
 
+type FiberOpticData struct {
+	DeviceID       string  `json:"device_id"`
+	Timestamp      string  `json:"timestamp"`
+	Position       float64 `json:"position"`
+	Latitude       float64 `json:"latitude"`
+	Longitude      float64 `json:"longitude"`
+	Strain         float64 `json:"strain"`
+	Temperature    float64 `json:"temperature"`
+	BrillouinShift float64 `json:"brillouin_shift"`
+	Status         string  `json:"status"`
+}
+
+type GasCompositionData struct {
+	DeviceID   string             `json:"device_id"`
+	Timestamp  string             `json:"timestamp"`
+	Position   float64            `json:"position"`
+	Latitude   float64            `json:"latitude"`
+	Longitude  float64            `json:"longitude"`
+	Components []GasComponent     `json:"components"`
+	Status     string             `json:"status"`
+}
+
+type GasComponent struct {
+	Component string  `json:"component"`
+	Fraction  float64 `json:"fraction"`
+}
+
+type PipeCorrosionData struct {
+	PipeID            string  `json:"pipe_id"`
+	Timestamp         string  `json:"timestamp"`
+	Position          float64 `json:"position"`
+	Latitude          float64 `json:"latitude"`
+	Longitude         float64 `json:"longitude"`
+	WallThickness     float64 `json:"wall_thickness"`
+	OriginalThickness float64 `json:"original_thickness"`
+	InspectionType    string  `json:"inspection_type"`
+}
+
+type PersonLocationData struct {
+	PersonID  string  `json:"person_id"`
+	Timestamp string  `json:"timestamp"`
+	Position  float64 `json:"position"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	FireZone  string  `json:"fire_zone"`
+	Status    string  `json:"status"`
+}
+
+type FiberSensor struct {
+	DeviceID  string
+	Position  float64
+	Latitude  float64
+	Longitude float64
+	FireZone  string
+}
+
+type GasAnalyzer struct {
+	DeviceID  string
+	Position  float64
+	Latitude  float64
+	Longitude float64
+	FireZone  string
+}
+
+type PipeSegment struct {
+	PipeID            string
+	StartPosition     float64
+	EndPosition       float64
+	OriginalThickness float64
+	CurrentThickness  float64
+}
+
+type Person struct {
+	PersonID     string
+	Position     float64
+	Latitude     float64
+	Longitude    float64
+	FireZone     string
+	IsMock       bool
+	MoveSpeed    float64
+	MoveDirection float64
+}
+
+type StrainAnomalySource struct {
+	ID       string  `json:"id"`
+	Position float64 `json:"position"`
+	Magnitude float64 `json:"magnitude"`
+	Enabled  bool    `json:"enabled"`
+}
+
 type SimulatorConfig struct {
-	Broker         string
-	ClientID       string
-	Username       string
-	Password       string
-	TotalDetectors int
-	TotalEnvSensors int
-	IntervalMs     int
-	CorridorLength float64
-	WindSpeed      float64
-	WindDir        float64
-	APIPort        string
+	Broker           string
+	ClientID         string
+	Username         string
+	Password         string
+	TotalDetectors   int
+	TotalEnvSensors  int
+	TotalFiberSensors int
+	TotalGasAnalyzers int
+	TotalPeople      int
+	IntervalMs       int
+	CorridorLength   float64
+	WindSpeed        float64
+	WindDir          float64
+	APIPort          string
+	FiberEnabled     bool
+	CompositionEnabled bool
+	CorrosionEnabled bool
+	PeopleEnabled    bool
 }
 
 type LaserDetector struct {
@@ -77,13 +174,27 @@ type APIResponse struct {
 }
 
 var (
-	cfg         SimulatorConfig
-	client      mqtt.Client
-	detectors   []*LaserDetector
-	envSensors  []*EnvSensor
-	leakSources []*LeakSource
-	leakMutex   sync.RWMutex
-	windMutex   sync.RWMutex
+	cfg             SimulatorConfig
+	client          mqtt.Client
+	detectors       []*LaserDetector
+	envSensors      []*EnvSensor
+	leakSources     []*LeakSource
+	fiberSensors    []*FiberSensor
+	gasAnalyzers    []*GasAnalyzer
+	pipeSegments    []*PipeSegment
+	people          []*Person
+	anomalySources  []*StrainAnomalySource
+	leakMutex       sync.RWMutex
+	windMutex       sync.RWMutex
+	anomalyMutex    sync.RWMutex
+	peopleMutex     sync.RWMutex
+	gasMixMutex     sync.RWMutex
+
+	gasSourceRatios = map[string]float64{
+		"natural_gas":   0.6,
+		"shale_gas":     0.25,
+		"biogas":        0.15,
+	}
 
 	messagesPublished = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -122,6 +233,37 @@ var (
 		},
 	)
 
+	strainGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "simulator_fiber_strain_microstrain",
+			Help: "Simulated fiber optic strain in microstrain",
+		},
+		[]string{"sensor_id"},
+	)
+
+	wobbeGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "simulator_wobbe_index_mj_m3",
+			Help: "Simulated Wobbe index in MJ/m³",
+		},
+		[]string{"analyzer_id"},
+	)
+
+	wallThicknessGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "simulator_pipe_wall_thickness_mm",
+			Help: "Simulated pipe wall thickness in mm",
+		},
+		[]string{"pipe_id"},
+	)
+
+	activePeopleGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "simulator_active_people",
+			Help: "Number of simulated people in corridor",
+		},
+	)
+
 	simulatorUptime = promauto.NewCounterFunc(
 		prometheus.CounterOpts{
 			Name: "simulator_uptime_seconds",
@@ -133,6 +275,7 @@ var (
 	)
 
 	startTime = time.Now()
+	lastCorrosionTime time.Time
 )
 
 func main() {
@@ -142,11 +285,18 @@ func main() {
 	flag.StringVar(&cfg.Password, "password", getEnv("MQTT_PASSWORD", "admin123"), "MQTT password")
 	flag.IntVar(&cfg.TotalDetectors, "detectors", getEnvInt("SIMULATOR_DETECTORS", 300), "Total number of laser detectors")
 	flag.IntVar(&cfg.TotalEnvSensors, "env-sensors", 50, "Total number of environment sensors")
+	flag.IntVar(&cfg.TotalFiberSensors, "fiber-sensors", getEnvInt("SIMULATOR_FIBER_SENSORS", 10), "Total number of fiber optic sensors")
+	flag.IntVar(&cfg.TotalGasAnalyzers, "gas-analyzers", getEnvInt("SIMULATOR_GAS_ANALYZERS", 3), "Total number of gas analyzers")
+	flag.IntVar(&cfg.TotalPeople, "people", getEnvInt("SIMULATOR_PEOPLE", 8), "Total number of simulated people")
 	flag.IntVar(&cfg.IntervalMs, "interval", getEnvInt("SIMULATOR_INTERVAL", 1000), "Data sending interval in milliseconds")
 	flag.Float64Var(&cfg.CorridorLength, "corridor-length", getEnvFloat("SIMULATOR_CORRIDOR_LENGTH", 30000), "Corridor length in meters")
 	flag.Float64Var(&cfg.WindSpeed, "wind-speed", getEnvFloat("SIMULATOR_WIND_SPEED", 1.5), "Wind speed in m/s")
 	flag.Float64Var(&cfg.WindDir, "wind-dir", getEnvFloat("SIMULATOR_WIND_DIR", 90.0), "Wind direction in degrees")
 	flag.StringVar(&cfg.APIPort, "api-port", "8081", "HTTP API port")
+	flag.BoolVar(&cfg.FiberEnabled, "fiber-enabled", getEnvBool("SIMULATOR_FIBER_ENABLED", true), "Enable fiber optic simulation")
+	flag.BoolVar(&cfg.CompositionEnabled, "composition-enabled", getEnvBool("SIMULATOR_COMPOSITION_ENABLED", true), "Enable gas composition simulation")
+	flag.BoolVar(&cfg.CorrosionEnabled, "corrosion-enabled", getEnvBool("SIMULATOR_CORROSION_ENABLED", true), "Enable corrosion simulation")
+	flag.BoolVar(&cfg.PeopleEnabled, "people-enabled", getEnvBool("SIMULATOR_PEOPLE_ENABLED", true), "Enable people tracking simulation")
 	flag.Parse()
 
 	if getEnvBool("SIMULATOR_LEAK_ENABLED", false) {
@@ -161,15 +311,28 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	initSensors()
+	initNewSensors()
 	initMQTT()
 	defer client.Disconnect(250)
 
 	go startHTTPServer()
 
-	log.Printf("=== 激光检测器模拟器启动 ===")
+	log.Printf("=== 综合管廊多参数模拟器启动 ===")
 	log.Printf("  管廊长度: %.0f 米 (%.1f 公里)", cfg.CorridorLength, cfg.CorridorLength/1000)
 	log.Printf("  激光检测器: %d 台 (每 %.1f 米1台)", cfg.TotalDetectors, cfg.CorridorLength/float64(cfg.TotalDetectors))
 	log.Printf("  环境传感器: %d 台", cfg.TotalEnvSensors)
+	if cfg.FiberEnabled {
+		log.Printf("  光纤传感器: %d 台", cfg.TotalFiberSensors)
+	}
+	if cfg.CompositionEnabled {
+		log.Printf("  气体分析仪: %d 台", cfg.TotalGasAnalyzers)
+	}
+	if cfg.CorrosionEnabled {
+		log.Printf("  管道管段: %d 段", len(pipeSegments))
+	}
+	if cfg.PeopleEnabled {
+		log.Printf("  模拟人员: %d 人", cfg.TotalPeople)
+	}
 	log.Printf("  上报间隔: %d 毫秒", cfg.IntervalMs)
 	log.Printf("  初始风速: %.1f m/s, 风向: %.0f°", cfg.WindSpeed, cfg.WindDir)
 	log.Printf("  HTTP API: :%s", cfg.APIPort)
@@ -189,6 +352,7 @@ func main() {
 
 	for range ticker.C {
 		sendSensorData()
+		sendNewSensorData()
 	}
 }
 
@@ -236,6 +400,79 @@ func initSensors() {
 	}
 
 	log.Printf("初始化 %d 个激光检测器和 %d 个环境传感器", len(detectors), len(envSensors))
+}
+
+func initNewSensors() {
+	if cfg.FiberEnabled {
+		spacing := cfg.CorridorLength / float64(cfg.TotalFiberSensors)
+		fiberSensors = make([]*FiberSensor, cfg.TotalFiberSensors)
+		for i := 0; i < cfg.TotalFiberSensors; i++ {
+			position := float64(i+0.5) * spacing
+			fiberSensors[i] = &FiberSensor{
+				DeviceID:  fmt.Sprintf("FIBER-%02d", i+1),
+				Position:  position,
+				Latitude:  39.9042 + (position * 0.0000008),
+				Longitude: 116.4074 + (position * 0.000001),
+				FireZone:  fmt.Sprintf("ZONE-%02d", (i*3)+1),
+			}
+		}
+		log.Printf("初始化 %d 个光纤传感器", len(fiberSensors))
+	}
+
+	if cfg.CompositionEnabled {
+		spacing := cfg.CorridorLength / float64(cfg.TotalGasAnalyzers)
+		gasAnalyzers = make([]*GasAnalyzer, cfg.TotalGasAnalyzers)
+		for i := 0; i < cfg.TotalGasAnalyzers; i++ {
+			position := float64(i+0.5) * spacing
+			gasAnalyzers[i] = &GasAnalyzer{
+				DeviceID:  fmt.Sprintf("GAS-ANA-%02d", i+1),
+				Position:  position,
+				Latitude:  39.9042 + (position * 0.0000008),
+				Longitude: 116.4074 + (position * 0.000001),
+				FireZone:  fmt.Sprintf("ZONE-%02d", (i*3)+1),
+			}
+		}
+		log.Printf("初始化 %d 个气体分析仪", len(gasAnalyzers))
+	}
+
+	if cfg.CorrosionEnabled {
+		pipeSegments = make([]*PipeSegment, 30)
+		segSpacing := cfg.CorridorLength / 30
+		for i := 0; i < 30; i++ {
+			originalThickness := 12.0 + rand.Float64()*4.0
+			initialCorrosion := rand.Float64() * 1.0
+			pipeSegments[i] = &PipeSegment{
+				PipeID:            fmt.Sprintf("PIPE-%03d", i+1),
+				StartPosition:     float64(i) * segSpacing,
+				EndPosition:       float64(i+1) * segSpacing,
+				OriginalThickness: originalThickness,
+				CurrentThickness:  originalThickness - initialCorrosion,
+			}
+		}
+		log.Printf("初始化 %d 段管道腐蚀模拟", len(pipeSegments))
+		lastCorrosionTime = time.Now()
+	}
+
+	if cfg.PeopleEnabled {
+		people = make([]*Person, cfg.TotalPeople)
+		for i := 0; i < cfg.TotalPeople; i++ {
+			position := rand.Float64() * cfg.CorridorLength
+			people[i] = &Person{
+				PersonID:      fmt.Sprintf("WORKER-%03d", i+1),
+				Position:      position,
+				Latitude:      39.9042 + (position * 0.0000008),
+				Longitude:     116.4074 + (position * 0.000001),
+				FireZone:      fmt.Sprintf("ZONE-%02d", int(position/(cfg.CorridorLength/10))+1),
+				IsMock:        true,
+				MoveSpeed:     0.5 + rand.Float64()*1.0,
+				MoveDirection: 1.0,
+			}
+			if rand.Float64() > 0.5 {
+				people[i].MoveDirection = -1.0
+			}
+		}
+		log.Printf("初始化 %d 个模拟人员", len(people))
+	}
 }
 
 func initMQTT() {
@@ -292,6 +529,271 @@ func sendSensorData() {
 
 	windSpeedGauge.Set(windSpeed)
 	windDirGauge.Set(windDir)
+}
+
+func sendNewSensorData() {
+	now := time.Now()
+
+	if cfg.FiberEnabled {
+		for _, sensor := range fiberSensors {
+			data := generateFiberData(sensor, now)
+			publishFiberData(sensor.DeviceID, data)
+			strainGauge.WithLabelValues(sensor.DeviceID).Set(data.Strain)
+		}
+		messagesPublished.WithLabelValues("fiber").Add(float64(len(fiberSensors)))
+	}
+
+	if cfg.CompositionEnabled {
+		for _, analyzer := range gasAnalyzers {
+			data := generateCompositionData(analyzer, now)
+			publishCompositionData(analyzer.DeviceID, data)
+			wobbeGauge.WithLabelValues(analyzer.DeviceID).Set(estimateWobbe(data))
+		}
+		messagesPublished.WithLabelValues("gas_analyzer").Add(float64(len(gasAnalyzers)))
+	}
+
+	if cfg.CorrosionEnabled && time.Since(lastCorrosionTime) >= 30*time.Minute {
+		for _, pipe := range pipeSegments {
+			data := generateCorrosionData(pipe, now)
+			publishCorrosionData(pipe.PipeID, data)
+			wallThicknessGauge.WithLabelValues(pipe.PipeID).Set(pipe.CurrentThickness)
+		}
+		messagesPublished.WithLabelValues("corrosion").Add(float64(len(pipeSegments)))
+		lastCorrosionTime = now
+	}
+
+	if cfg.PeopleEnabled {
+		updatePeoplePositions()
+		for _, person := range people {
+			data := generatePersonLocationData(person, now)
+			publishPersonLocationData(person.PersonID, data)
+		}
+		messagesPublished.WithLabelValues("people").Add(float64(len(people)))
+		activePeopleGauge.Set(float64(len(people)))
+	}
+}
+
+func generateFiberData(sensor *FiberSensor, now time.Time) *FiberOpticData {
+	strain := 50.0 + rand.Float64()*100.0
+	temperature := 20.0 + rand.Float64()*5.0
+
+	anomalyMutex.RLock()
+	for _, anomaly := range anomalySources {
+		if anomaly.Enabled {
+			dist := math.Abs(sensor.Position - anomaly.Position)
+			if dist < 500 {
+				strain += anomaly.Magnitude * math.Exp(-dist/200)
+			}
+		}
+	}
+	anomalyMutex.RUnlock()
+
+	if strain > 800 {
+		strain = 800 + rand.Float64()*200
+	}
+
+	return &FiberOpticData{
+		DeviceID:       sensor.DeviceID,
+		Timestamp:      now.Format(time.RFC3339Nano),
+		Position:       sensor.Position,
+		Latitude:       sensor.Latitude,
+		Longitude:      sensor.Longitude,
+		Strain:         strain,
+		Temperature:    temperature,
+		BrillouinShift: strain * 0.05,
+		Status:         "normal",
+	}
+}
+
+func generateCompositionData(analyzer *GasAnalyzer, now time.Time) *GasCompositionData {
+	gasMixMutex.RLock()
+	defer gasMixMutex.RUnlock()
+
+	natGas := gasSourceRatios["natural_gas"]
+	shaleGas := gasSourceRatios["shale_gas"]
+	biogas := gasSourceRatios["biogas"]
+
+	components := []GasComponent{
+		{"CH4", 0.95*natGas + 0.80*shaleGas + 0.60*biogas},
+		{"C2H6", 0.03*natGas + 0.10*shaleGas + 0.05*biogas},
+		{"C3H8", 0.01*natGas + 0.05*shaleGas + 0.02*biogas},
+		{"CO2", 0.005*natGas + 0.02*shaleGas + 0.25*biogas},
+		{"N2", 0.003*natGas + 0.02*shaleGas + 0.05*biogas},
+		{"H2", 0.002*natGas + 0.01*shaleGas + 0.03*biogas},
+	}
+
+	for i := range components {
+		components[i].Fraction += (rand.Float64() - 0.5) * 0.02
+		if components[i].Fraction < 0 {
+			components[i].Fraction = 0
+		}
+	}
+
+	total := 0.0
+	for _, c := range components {
+		total += c.Fraction
+	}
+	for i := range components {
+		components[i].Fraction /= total
+	}
+
+	return &GasCompositionData{
+		DeviceID:   analyzer.DeviceID,
+		Timestamp:  now.Format(time.RFC3339Nano),
+		Position:   analyzer.Position,
+		Latitude:   analyzer.Latitude,
+		Longitude:  analyzer.Longitude,
+		Components: components,
+		Status:     "normal",
+	}
+}
+
+func estimateWobbe(data *GasCompositionData) float64 {
+	var hhv, mixDensity float64
+	for _, comp := range data.Components {
+		switch comp.Component {
+		case "CH4":
+			hhv += comp.Fraction * 39.8
+			mixDensity += comp.Fraction * 0.717
+		case "C2H6":
+			hhv += comp.Fraction * 70.3
+			mixDensity += comp.Fraction * 1.356
+		case "C3H8":
+			hhv += comp.Fraction * 101.0
+			mixDensity += comp.Fraction * 2.010
+		case "CO2":
+			mixDensity += comp.Fraction * 1.977
+		case "N2":
+			mixDensity += comp.Fraction * 1.250
+		case "H2":
+			hhv += comp.Fraction * 12.7
+			mixDensity += comp.Fraction * 0.090
+		}
+	}
+	relDensity := mixDensity / 1.293
+	return hhv / math.Sqrt(relDensity)
+}
+
+func generateCorrosionData(pipe *PipeSegment, now time.Time) *PipeCorrosionData {
+	corrosionRate := 0.0001 + rand.Float64()*0.0002
+	pipe.CurrentThickness -= corrosionRate * (30.0 / 1440.0)
+	if pipe.CurrentThickness < pipe.OriginalThickness*0.6 {
+		pipe.CurrentThickness = pipe.OriginalThickness * 0.6
+	}
+
+	position := pipe.StartPosition + rand.Float64()*(pipe.EndPosition-pipe.StartPosition)
+	return &PipeCorrosionData{
+		PipeID:            pipe.PipeID,
+		Timestamp:         now.Format(time.RFC3339Nano),
+		Position:          position,
+		Latitude:          39.9042 + (position * 0.0000008),
+		Longitude:         116.4074 + (position * 0.000001),
+		WallThickness:     pipe.CurrentThickness,
+		OriginalThickness: pipe.OriginalThickness,
+		InspectionType:    "UT",
+	}
+}
+
+func updatePeoplePositions() {
+	peopleMutex.Lock()
+	defer peopleMutex.Unlock()
+
+	intervalSec := float64(cfg.IntervalMs) / 1000.0
+	for _, person := range people {
+		if rand.Float64() < 0.01 {
+			person.MoveDirection *= -1
+		}
+		if rand.Float64() < 0.02 {
+			person.MoveSpeed = 0.3 + rand.Float64()*1.2
+		}
+
+		person.Position += person.MoveDirection * person.MoveSpeed * intervalSec
+
+		if person.Position < 0 {
+			person.Position = 0
+			person.MoveDirection = 1.0
+		}
+		if person.Position > cfg.CorridorLength {
+			person.Position = cfg.CorridorLength
+			person.MoveDirection = -1.0
+		}
+
+		person.Latitude = 39.9042 + (person.Position * 0.0000008)
+		person.Longitude = 116.4074 + (person.Position * 0.000001)
+		person.FireZone = fmt.Sprintf("ZONE-%02d", int(person.Position/(cfg.CorridorLength/10))+1)
+	}
+}
+
+func generatePersonLocationData(person *Person, now time.Time) *PersonLocationData {
+	return &PersonLocationData{
+		PersonID:  person.PersonID,
+		Timestamp: now.Format(time.RFC3339Nano),
+		Position:  person.Position,
+		Latitude:  person.Latitude,
+		Longitude: person.Longitude,
+		FireZone:  person.FireZone,
+		Status:    "active",
+	}
+}
+
+func publishFiberData(deviceID string, data *FiberOpticData) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("序列化光纤数据失败: %v", err)
+		return
+	}
+	topic := fmt.Sprintf("sensors/fiber/%s/data", deviceID)
+	token := client.Publish(topic, 2, true, payload)
+	go func() {
+		if token.Wait() && token.Error() != nil {
+			log.Printf("发布光纤数据到 %s 失败: %v", topic, token.Error())
+		}
+	}()
+}
+
+func publishCompositionData(deviceID string, data *GasCompositionData) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("序列化气体成分数据失败: %v", err)
+		return
+	}
+	topic := fmt.Sprintf("sensors/gas-analyzer/%s/data", deviceID)
+	token := client.Publish(topic, 2, true, payload)
+	go func() {
+		if token.Wait() && token.Error() != nil {
+			log.Printf("发布气体成分数据到 %s 失败: %v", topic, token.Error())
+		}
+	}()
+}
+
+func publishCorrosionData(pipeID string, data *PipeCorrosionData) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("序列化腐蚀数据失败: %v", err)
+		return
+	}
+	topic := fmt.Sprintf("inspection/corrosion/%s/data", pipeID)
+	token := client.Publish(topic, 2, true, payload)
+	go func() {
+		if token.Wait() && token.Error() != nil {
+			log.Printf("发布腐蚀数据到 %s 失败: %v", topic, token.Error())
+		}
+	}()
+}
+
+func publishPersonLocationData(personID string, data *PersonLocationData) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("序列化人员位置数据失败: %v", err)
+		return
+	}
+	topic := fmt.Sprintf("tracking/person/%s/location", personID)
+	token := client.Publish(topic, 2, false, payload)
+	go func() {
+		if token.Wait() && token.Error() != nil {
+			log.Printf("发布人员位置数据到 %s 失败: %v", topic, token.Error())
+		}
+	}()
 }
 
 func generateLaserData(detector *LaserDetector, now time.Time, windSpeed, windDir float64) *SensorData {
@@ -412,6 +914,21 @@ func startHTTPServer() {
 	mux.HandleFunc("/api/leaks/add", handleAddLeak)
 	mux.HandleFunc("/api/leaks/remove", handleRemoveLeak)
 	mux.HandleFunc("/api/leaks/toggle", handleToggleLeak)
+
+	mux.HandleFunc("/api/fiber/anomalies", handleStrainAnomalies)
+	mux.HandleFunc("/api/fiber/anomalies/add", handleAddStrainAnomaly)
+	mux.HandleFunc("/api/fiber/anomalies/remove", handleRemoveStrainAnomaly)
+	mux.HandleFunc("/api/fiber/anomalies/toggle", handleToggleStrainAnomaly)
+
+	mux.HandleFunc("/api/gas/mix-ratios", handleGasMixRatios)
+	mux.HandleFunc("/api/gas/mix-ratios/update", handleUpdateGasMixRatios)
+
+	mux.HandleFunc("/api/corrosion/trigger", handleTriggerCorrosionInspection)
+
+	mux.HandleFunc("/api/people", handleGetPeople)
+	mux.HandleFunc("/api/people/add", handleAddPerson)
+	mux.HandleFunc("/api/people/remove", handleRemovePerson)
+
 	mux.HandleFunc("/api/reset", handleReset)
 	mux.Handle("/metrics", promhttp.Handler())
 
@@ -641,17 +1158,366 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	leakSources = make([]*LeakSource, 0)
 	leakMutex.Unlock()
 
+	anomalyMutex.Lock()
+	anomalySources = make([]*StrainAnomalySource, 0)
+	anomalyMutex.Unlock()
+
+	gasMixMutex.Lock()
+	gasSourceRatios = map[string]float64{
+		"natural_gas": 0.6,
+		"shale_gas":   0.25,
+		"biogas":      0.15,
+	}
+	gasMixMutex.Unlock()
+
 	windMutex.Lock()
 	cfg.WindSpeed = 1.5
 	cfg.WindDir = 90.0
 	windMutex.Unlock()
 
-	log.Println("模拟器已重置: 清除所有泄漏源，风速风向恢复默认")
+	log.Println("模拟器已重置: 清除所有异常源，恢复默认配置")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(APIResponse{
 		Success: true,
 		Message: "模拟器已重置",
+	})
+}
+
+func handleStrainAnomalies(w http.ResponseWriter, r *http.Request) {
+	anomalyMutex.RLock()
+	defer anomalyMutex.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Data:    anomalySources,
+	})
+}
+
+func handleAddStrainAnomaly(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req StrainAnomalySource
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "无效的请求体"})
+		return
+	}
+
+	if req.ID == "" {
+		req.ID = fmt.Sprintf("anomaly-%d", time.Now().Unix())
+	}
+	if req.Position < 0 || req.Position > cfg.CorridorLength {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: fmt.Sprintf("异常位置必须在0-%.0f米之间", cfg.CorridorLength)})
+		return
+	}
+	if req.Magnitude <= 0 {
+		req.Magnitude = 1000.0
+	}
+	req.Enabled = true
+
+	anomalyMutex.Lock()
+	anomalySources = append(anomalySources, &req)
+	anomalyMutex.Unlock()
+
+	log.Printf("新增应变异常源: %s, 位置: %.0f米, 幅度: %.0f", req.ID, req.Position, req.Magnitude)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Message: "应变异常源已添加",
+		Data:    req,
+	})
+}
+
+func handleRemoveStrainAnomaly(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "无效的请求体"})
+		return
+	}
+
+	anomalyMutex.Lock()
+	deleted := false
+	for i, anomaly := range anomalySources {
+		if anomaly.ID == req.ID {
+			anomalySources = append(anomalySources[:i], anomalySources[i+1:]...)
+			deleted = true
+			break
+		}
+	}
+	anomalyMutex.Unlock()
+
+	if !deleted {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "应变异常源不存在"})
+		return
+	}
+
+	log.Printf("移除应变异常源: %s", req.ID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Message: "应变异常源已移除",
+	})
+}
+
+func handleToggleStrainAnomaly(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID      string `json:"id"`
+		Enabled *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "无效的请求体"})
+		return
+	}
+
+	anomalyMutex.Lock()
+	found := false
+	for _, anomaly := range anomalySources {
+		if anomaly.ID == req.ID {
+			if req.Enabled != nil {
+				anomaly.Enabled = *req.Enabled
+			} else {
+				anomaly.Enabled = !anomaly.Enabled
+			}
+			found = true
+			log.Printf("应变异常源 %s 状态: %v", req.ID, anomaly.Enabled)
+			break
+		}
+	}
+	anomalyMutex.Unlock()
+
+	if !found {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "应变异常源不存在"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Message: "应变异常源状态已更新",
+	})
+}
+
+func handleGasMixRatios(w http.ResponseWriter, r *http.Request) {
+	gasMixMutex.RLock()
+	defer gasMixMutex.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Data:    gasSourceRatios,
+	})
+}
+
+func handleUpdateGasMixRatios(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req map[string]float64
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "无效的请求体"})
+		return
+	}
+
+	gasMixMutex.Lock()
+	for key, value := range req {
+		if _, exists := gasSourceRatios[key]; exists {
+			if value >= 0 && value <= 1 {
+				gasSourceRatios[key] = value
+			}
+		}
+	}
+
+	total := 0.0
+	for _, v := range gasSourceRatios {
+		total += v
+	}
+	if total > 0 {
+		for k := range gasSourceRatios {
+			gasSourceRatios[k] /= total
+		}
+	}
+	gasMixMutex.Unlock()
+
+	log.Printf("更新气源混合比例: %+v", gasSourceRatios)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Message: "气源混合比例已更新",
+		Data:    gasSourceRatios,
+	})
+}
+
+func handleTriggerCorrosionInspection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	now := time.Now()
+	count := 0
+	for _, pipe := range pipeSegments {
+		data := generateCorrosionData(pipe, now)
+		publishCorrosionData(pipe.PipeID, data)
+		wallThicknessGauge.WithLabelValues(pipe.PipeID).Set(pipe.CurrentThickness)
+		count++
+	}
+	messagesPublished.WithLabelValues("corrosion").Add(float64(count))
+	lastCorrosionTime = now
+
+	log.Printf("手动触发 %d 段管道腐蚀检测", count)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Message: fmt.Sprintf("已触发 %d 段管道腐蚀检测", count),
+	})
+}
+
+func handleGetPeople(w http.ResponseWriter, r *http.Request) {
+	peopleMutex.RLock()
+	defer peopleMutex.RUnlock()
+
+	type PersonInfo struct {
+		PersonID  string  `json:"person_id"`
+		Position  float64 `json:"position"`
+		Latitude  float64 `json:"latitude"`
+		Longitude float64 `json:"longitude"`
+		FireZone  string  `json:"fire_zone"`
+		Status    string  `json:"status"`
+	}
+
+	result := make([]PersonInfo, len(people))
+	for i, p := range people {
+		result[i] = PersonInfo{
+			PersonID:  p.PersonID,
+			Position:  p.Position,
+			Latitude:  p.Latitude,
+			Longitude: p.Longitude,
+			FireZone:  p.FireZone,
+			Status:    "active",
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Data:    result,
+	})
+}
+
+func handleAddPerson(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Position float64 `json:"position"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "无效的请求体"})
+		return
+	}
+
+	if req.Position < 0 || req.Position > cfg.CorridorLength {
+		req.Position = rand.Float64() * cfg.CorridorLength
+	}
+
+	peopleMutex.Lock()
+	newID := fmt.Sprintf("WORKER-%03d", len(people)+1)
+	person := &Person{
+		PersonID:      newID,
+		Position:      req.Position,
+		Latitude:      39.9042 + (req.Position * 0.0000008),
+		Longitude:     116.4074 + (req.Position * 0.000001),
+		FireZone:      fmt.Sprintf("ZONE-%02d", int(req.Position/(cfg.CorridorLength/10))+1),
+		IsMock:        true,
+		MoveSpeed:     0.5 + rand.Float64()*1.0,
+		MoveDirection: 1.0,
+	}
+	if rand.Float64() > 0.5 {
+		person.MoveDirection = -1.0
+	}
+	people = append(people, person)
+	peopleMutex.Unlock()
+
+	log.Printf("新增模拟人员: %s, 位置: %.0f米", newID, req.Position)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Message: "模拟人员已添加",
+		Data:    person,
+	})
+}
+
+func handleRemovePerson(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		PersonID string `json:"person_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "无效的请求体"})
+		return
+	}
+
+	peopleMutex.Lock()
+	deleted := false
+	for i, p := range people {
+		if p.PersonID == req.PersonID {
+			people = append(people[:i], people[i+1:]...)
+			deleted = true
+			break
+		}
+	}
+	peopleMutex.Unlock()
+
+	if !deleted {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(APIResponse{Success: false, Message: "人员不存在"})
+		return
+	}
+
+	log.Printf("移除模拟人员: %s", req.PersonID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(APIResponse{
+		Success: true,
+		Message: "模拟人员已移除",
 	})
 }
 

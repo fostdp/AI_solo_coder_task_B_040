@@ -20,6 +20,10 @@ type Config struct {
 	LeakLocator        LeakLocatorConfig        `mapstructure:"leak_locator"`
 	EmergencyController EmergencyControllerConfig `mapstructure:"emergency_controller"`
 	AlarmRouter        AlarmRouterConfig        `mapstructure:"alarm_router"`
+	FiberMonitor       FiberMonitorConfig       `mapstructure:"fiber_monitor"`
+	CorrosionMonitor   CorrosionMonitorConfig   `mapstructure:"corrosion_monitor"`
+	CalorificControl   CalorificControlConfig   `mapstructure:"calorific_control"`
+	EvacuationPlanner  EvacuationPlannerConfig  `mapstructure:"evacuation_planner"`
 }
 
 type ServerConfig struct {
@@ -160,4 +164,54 @@ type AlarmRouterConfig struct {
 	SMSMinLevel         int           `mapstructure:"sms_min_level"`
 	SMSInterval         time.Duration `mapstructure:"sms_interval"`
 	SMSMaxPerInterval   int           `mapstructure:"sms_max_per_interval"`
+}
+
+type FiberMonitorConfig struct {
+	FiberCount            int           `mapstructure:"fiber_count"`
+	SensingInterval       time.Duration `mapstructure:"sensing_interval"`
+	SpatialResolution     float64       `mapstructure:"spatial_resolution"`
+	StrainWarningThreshold float64      `mapstructure:"strain_warning_threshold"`
+	StrainAlarmThreshold   float64      `mapstructure:"strain_alarm_threshold"`
+	TemperatureWarningThreshold float64 `mapstructure:"temperature_warning_threshold"`
+	TemperatureAlarmThreshold  float64 `mapstructure:"temperature_alarm_threshold"`
+	BrillouinCoefficient  float64       `mapstructure:"brillouin_coefficient"`
+	AnomalyMergeDistance  float64       `mapstructure:"anomaly_merge_distance"`
+	StatsInterval         time.Duration `mapstructure:"stats_interval"`
+}
+
+type CorrosionMonitorConfig struct {
+	InspectionInterval    time.Duration `mapstructure:"inspection_interval"`
+	MinWallThickness      float64       `mapstructure:"min_wall_thickness"`
+	CriticalWallThickness float64       `mapstructure:"critical_wall_thickness"`
+	PredictionHorizonMonths int         `mapstructure:"prediction_horizon_months"`
+	GreyModelOrder        int           `mapstructure:"grey_model_order"`
+	ExponentialDecayRate  float64       `mapstructure:"exponential_decay_rate"`
+	ReplacementThreshold  float64       `mapstructure:"replacement_threshold"`
+	HighPriorityRate      float64       `mapstructure:"high_priority_rate"`
+	MediumPriorityRate    float64       `mapstructure:"medium_priority_rate"`
+	StatsInterval         time.Duration `mapstructure:"stats_interval"`
+}
+
+type CalorificControlConfig struct {
+	AnalyzerCount         int           `mapstructure:"analyzer_count"`
+	AnalysisInterval      time.Duration `mapstructure:"analysis_interval"`
+	TargetWobbeIndex      float64       `mapstructure:"target_wobbe_index"`
+	WobbeTolerance        float64       `mapstructure:"wobbe_tolerance"`
+	MaxValveAdjustment    float64       `mapstructure:"max_valve_adjustment"`
+	ValveCooldown         time.Duration `mapstructure:"valve_cooldown"`
+	MethaneSourceName     string        `mapstructure:"methane_source_name"`
+	HydrogenSourceName    string        `mapstructure:"hydrogen_source_name"`
+	NaturalGasSourceName  string        `mapstructure:"natural_gas_source_name"`
+	StatsInterval         time.Duration `mapstructure:"stats_interval"`
+}
+
+type EvacuationPlannerConfig struct {
+	PlanningInterval      time.Duration `mapstructure:"planning_interval"`
+	PersonSpeedMetersPerMin float64     `mapstructure:"person_speed_meters_per_min"`
+	MaxRouteAgeSeconds    int           `mapstructure:"max_route_age_seconds"`
+	MinExitDistance       float64       `mapstructure:"min_exit_distance"`
+	BroadcastRepeatCount  int           `mapstructure:"broadcast_repeat_count"`
+	BroadcastInterval     time.Duration `mapstructure:"broadcast_interval"`
+	GraphUpdateInterval   time.Duration `mapstructure:"graph_update_interval"`
+	StatsInterval         time.Duration `mapstructure:"stats_interval"`
 }

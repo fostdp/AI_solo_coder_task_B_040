@@ -93,6 +93,42 @@ func SetupRouter() *gin.Engine {
 		api.POST("/zones/:zone/reset", h.ResetZone)
 
 		api.GET("/ws", h.WebSocket)
+
+		fiber := api.Group("/fiber")
+		{
+			fiber.GET("/anomalies", h.GetStrainAnomalies)
+			fiber.GET("/sensors", h.GetFiberSensors)
+			fiber.POST("/data", h.ReceiveFiberData)
+			fiber.POST("/anomalies/:id/resolve", h.ResolveStrainAnomaly)
+		}
+
+		corrosion := api.Group("/corrosion")
+		{
+			corrosion.GET("/pipes", h.GetCorrosionPipes)
+			corrosion.GET("/data", h.GetCorrosionData)
+			corrosion.GET("/high-priority", h.GetHighPriorityPipes)
+			corrosion.GET("/predictions", h.GetCorrosionPredictions)
+			corrosion.POST("/inspection", h.AddCorrosionInspection)
+		}
+
+		calorific := api.Group("/calorific")
+		{
+			calorific.GET("/wobbe", h.GetWobbeIndices)
+			calorific.GET("/analyzers", h.GetGasAnalyzers)
+			calorific.GET("/valves", h.GetGasValves)
+			calorific.POST("/composition", h.ReceiveGasComposition)
+			calorific.POST("/valves/:id/control", h.ControlGasValve)
+		}
+
+		evacuation := api.Group("/evacuation")
+		{
+			evacuation.GET("/routes", h.GetEvacuationRoutes)
+			evacuation.GET("/exits", h.GetExitPoints)
+			evacuation.GET("/people", h.GetPeopleLocations)
+			evacuation.GET("/broadcasts", h.GetBroadcastMessages)
+			evacuation.POST("/people", h.UpdatePersonLocation)
+			evacuation.POST("/trigger", h.TriggerEvacuation)
+		}
 	}
 
 	r.Static("/static", "./frontend")

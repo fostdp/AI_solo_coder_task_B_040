@@ -9,6 +9,10 @@ const App = (function() {
         CorridorMapModule.init();
         GasPanelModule.init();
         HeatmapModule.init();
+        FiberMonitor.init();
+        CorrosionMonitor.init();
+        CalorificControl.init();
+        EvacuationPlanner.init();
         
         setupEventListeners();
         setupWebSocketCallbacks();
@@ -63,6 +67,57 @@ const App = (function() {
                 GasPanelModule.focusOnAlarm(alarmId);
             }
         });
+
+        document.querySelectorAll('.tab-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var tabName = this.getAttribute('data-tab');
+                document.querySelectorAll('.tab-btn').forEach(function(b) {
+                    b.classList.remove('active');
+                });
+                document.querySelectorAll('.tab-content').forEach(function(c) {
+                    c.classList.remove('active');
+                });
+                this.classList.add('active');
+                document.getElementById('tab-' + tabName).classList.add('active');
+                
+                if (tabName === 'map' && window.CorridorMapModule) {
+                    setTimeout(function() {
+                        CorridorMapModule.map.invalidateSize();
+                    }, 100);
+                }
+            });
+        });
+
+        document.getElementById('btn-toggle-fiber').addEventListener('click', function() {
+            const visible = FiberMonitor.toggleMapLayer();
+            this.classList.toggle('active', visible);
+            this.textContent = visible ? '光纤监测' : '隐藏光纤';
+        });
+
+        document.getElementById('btn-toggle-corrosion').addEventListener('click', function() {
+            const visible = CorrosionMonitor.toggleMapLayer();
+            this.classList.toggle('active', visible);
+            this.textContent = visible ? '腐蚀预测' : '隐藏腐蚀';
+        });
+
+        document.getElementById('btn-toggle-calorific').addEventListener('click', function() {
+            const visible = CalorificControl.toggleMapLayer();
+            this.classList.toggle('active', visible);
+            this.textContent = visible ? '热值调节' : '隐藏热值';
+        });
+
+        document.getElementById('btn-toggle-evacuation').addEventListener('click', function() {
+            const visible = EvacuationPlanner.toggleMapLayer();
+            this.classList.toggle('active', visible);
+            this.textContent = visible ? '疏散路径' : '隐藏疏散';
+        });
+
+        const triggerBtn = document.getElementById('btn-trigger-evacuation');
+        if (triggerBtn) {
+            triggerBtn.addEventListener('click', function() {
+                EvacuationPlanner.triggerManualEvacuation();
+            });
+        }
     }
 
     function setupWebSocketCallbacks() {
@@ -81,6 +136,13 @@ const App = (function() {
         WebSocketModule.setOnStatusUpdate(function(data) {
             console.log('WebSocket状态:', data);
         });
+
+        WebSocketModule.setGenericMessageHandler(function(msg) {
+            if (window.FiberMonitor) FiberMonitor.handleWebSocketMessage(msg);
+            if (window.CorrosionMonitor) CorrosionMonitor.handleWebSocketMessage(msg);
+            if (window.CalorificControl) CalorificControl.handleWebSocketMessage(msg);
+            if (window.EvacuationPlanner) EvacuationPlanner.handleWebSocketMessage(msg);
+        });
     }
 
     async function loadInitialData() {
@@ -89,7 +151,11 @@ const App = (function() {
                 loadDetectors(),
                 GasPanelModule.loadActiveAlarms(),
                 loadLeakSources(),
-                GasPanelModule.loadStatistics()
+                GasPanelModule.loadStatistics(),
+                FiberMonitor.loadData(),
+                CorrosionMonitor.loadData(),
+                CalorificControl.loadData(),
+                EvacuationPlanner.loadData()
             ]);
             
             CorridorMapModule.loadPipeCorridor();
@@ -140,7 +206,11 @@ const App = (function() {
                 }),
                 GasPanelModule.loadActiveAlarms(),
                 loadLeakSources(),
-                GasPanelModule.loadStatistics()
+                GasPanelModule.loadStatistics(),
+                FiberMonitor.loadData(),
+                CorrosionMonitor.loadData(),
+                CalorificControl.loadData(),
+                EvacuationPlanner.loadData()
             ]);
             
             const selectedDetector = GasPanelModule.getSelectedDetector();

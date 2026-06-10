@@ -9,6 +9,7 @@ const WebSocketModule = (function() {
     let onAlarmUpdate = null;
     let onLeakSourceUpdate = null;
     let onStatusUpdate = null;
+    let onGenericMessage = null;
 
     function connect() {
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -82,7 +83,11 @@ const WebSocketModule = (function() {
                 }
                 break;
             default:
-                console.log('未知消息类型:', message.type);
+                if (onGenericMessage) {
+                    onGenericMessage(message);
+                } else {
+                    console.log('未知消息类型:', message.type);
+                }
         }
     }
 
@@ -135,6 +140,10 @@ const WebSocketModule = (function() {
         onStatusUpdate = callback;
     }
 
+    function setGenericMessageHandler(callback) {
+        onGenericMessage = callback;
+    }
+
     function isConnected() {
         return ws && ws.readyState === WebSocket.OPEN;
     }
@@ -147,6 +156,7 @@ const WebSocketModule = (function() {
         setOnAlarmUpdate: setOnAlarmUpdate,
         setOnLeakSourceUpdate: setOnLeakSourceUpdate,
         setOnStatusUpdate: setOnStatusUpdate,
+        setGenericMessageHandler: setGenericMessageHandler,
         isConnected: isConnected
     };
 })();

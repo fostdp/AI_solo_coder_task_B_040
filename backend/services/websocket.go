@@ -128,6 +128,28 @@ func (ws *WebSocketService) startDataPush() {
 				"timestamp": time.Now(),
 			}
 		}
+
+		if FiberMonitor != nil {
+			anomalies := FiberMonitor.GetActiveAnomalies()
+			if len(anomalies) > 0 {
+				ws.broadcast <- map[string]interface{}{
+					"type":      "fiber_anomaly",
+					"data":      anomalies,
+					"timestamp": time.Now(),
+				}
+			}
+		}
+
+		if CalorificControl != nil {
+			wobbe := CalorificControl.GetCurrentWobbe()
+			if wobbe != nil {
+				ws.broadcast <- map[string]interface{}{
+					"type":      "wobbe_update",
+					"data":      wobbe,
+					"timestamp": time.Now(),
+				}
+			}
+		}
 	}
 }
 
@@ -149,6 +171,61 @@ func BroadcastLeakSource(leak *models.LeakSource) {
 	WSService.broadcast <- map[string]interface{}{
 		"type":      "leak_source",
 		"data":      leak,
+		"timestamp": time.Now(),
+	}
+}
+
+func BroadcastStrainAnomaly(anomaly *models.StrainAnomaly) {
+	if WSService == nil {
+		return
+	}
+	WSService.broadcast <- map[string]interface{}{
+		"type":      "fiber_anomaly",
+		"data":      []*models.StrainAnomaly{anomaly},
+		"timestamp": time.Now(),
+	}
+}
+
+func BroadcastCorrosionPrediction(prediction *models.CorrosionPrediction) {
+	if WSService == nil {
+		return
+	}
+	WSService.broadcast <- map[string]interface{}{
+		"type":      "corrosion_prediction",
+		"data":      prediction,
+		"timestamp": time.Now(),
+	}
+}
+
+func BroadcastWobbeUpdate(wobbe *models.WobbeIndex) {
+	if WSService == nil {
+		return
+	}
+	WSService.broadcast <- map[string]interface{}{
+		"type":      "wobbe_update",
+		"data":      wobbe,
+		"timestamp": time.Now(),
+	}
+}
+
+func BroadcastEvacuationRoute(route *models.EvacuationRoute) {
+	if WSService == nil {
+		return
+	}
+	WSService.broadcast <- map[string]interface{}{
+		"type":      "evacuation_route",
+		"data":      route,
+		"timestamp": time.Now(),
+	}
+}
+
+func BroadcastMessage(msg *models.BroadcastMessage) {
+	if WSService == nil {
+		return
+	}
+	WSService.broadcast <- map[string]interface{}{
+		"type":      "broadcast_message",
+		"data":      msg,
 		"timestamp": time.Now(),
 	}
 }
