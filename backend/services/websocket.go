@@ -129,8 +129,8 @@ func (ws *WebSocketService) startDataPush() {
 			}
 		}
 
-		if FiberMonitor != nil {
-			anomalies := FiberMonitor.GetActiveAnomalies()
+		if StructureMonitor != nil {
+			anomalies := StructureMonitor.GetActiveAnomalies()
 			if len(anomalies) > 0 {
 				ws.broadcast <- map[string]interface{}{
 					"type":      "fiber_anomaly",
@@ -140,8 +140,8 @@ func (ws *WebSocketService) startDataPush() {
 			}
 		}
 
-		if CalorificControl != nil {
-			wobbe := CalorificControl.GetCurrentWobbe()
+		if CalorificController != nil {
+			wobbe := CalorificController.GetCurrentWobbe()
 			if wobbe != nil {
 				ws.broadcast <- map[string]interface{}{
 					"type":      "wobbe_update",

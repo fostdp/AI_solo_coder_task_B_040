@@ -12,11 +12,11 @@ import (
 	"gas-monitoring-system/backend/config"
 	"gas-monitoring-system/backend/models"
 	"gas-monitoring-system/backend/modules/alarm_router"
-	"gas-monitoring-system/backend/modules/calorific_control"
-	"gas-monitoring-system/backend/modules/corrosion_monitor"
+	"gas-monitoring-system/backend/modules/calorific_controller"
+	"gas-monitoring-system/backend/modules/corrosion_predictor"
 	"gas-monitoring-system/backend/modules/emergency_controller"
 	"gas-monitoring-system/backend/modules/evacuation_planner"
-	"gas-monitoring-system/backend/modules/fiber_monitor"
+	"gas-monitoring-system/backend/modules/structure_monitor"
 	"gas-monitoring-system/backend/modules/laser_receiver"
 	"gas-monitoring-system/backend/modules/leak_locator"
 	"gas-monitoring-system/backend/mqtt"
@@ -93,25 +93,25 @@ func main() {
 	services.EmergencyController.Start()
 	defer services.EmergencyController.Stop()
 
-	services.FiberMonitor = fiber_monitor.NewFiberMonitor(&cfg.FiberMonitor)
-	services.FiberMonitor.SetChannels(anomalyChan)
-	services.FiberMonitor.SetCorridorPoints(corridorPoints)
-	services.FiberMonitor.Start(ctx)
-	defer services.FiberMonitor.Stop()
+	services.StructureMonitor = structure_monitor.NewStructureMonitor(&cfg.FiberMonitor)
+	services.StructureMonitor.SetChannels(anomalyChan)
+	services.StructureMonitor.SetCorridorPoints(corridorPoints)
+	services.StructureMonitor.Start(ctx)
+	defer services.StructureMonitor.Stop()
 
-	services.CorrosionMonitor = corrosion_monitor.NewCorrosionMonitor(&cfg.CorrosionMonitor)
-	services.CorrosionMonitor.SetChannels(corrosionChan)
-	services.CorrosionMonitor.SetCorridorPoints(corridorPoints)
-	services.CorrosionMonitor.Start(ctx)
-	defer services.CorrosionMonitor.Stop()
+	services.CorrosionPredictor = corrosion_predictor.NewCorrosionPredictor(&cfg.CorrosionMonitor)
+	services.CorrosionPredictor.SetChannels(corrosionChan)
+	services.CorrosionPredictor.SetCorridorPoints(corridorPoints)
+	services.CorrosionPredictor.Start(ctx)
+	defer services.CorrosionPredictor.Stop()
 
-	services.CalorificControl = calorific_control.NewCalorificControl(&cfg.CalorificControl)
-	services.CalorificControl.SetChannels(compositionChan, wobbeChan, valveControlChan)
-	services.CalorificControl.SetValveState("source-a", 60.0)
-	services.CalorificControl.SetValveState("source-b", 20.0)
-	services.CalorificControl.SetValveState("source-c", 40.0)
-	services.CalorificControl.Start(ctx)
-	defer services.CalorificControl.Stop()
+	services.CalorificController = calorific_controller.NewCalorificController(&cfg.CalorificControl)
+	services.CalorificController.SetChannels(compositionChan, wobbeChan, valveControlChan)
+	services.CalorificController.SetValveState("source-a", 60.0)
+	services.CalorificController.SetValveState("source-b", 20.0)
+	services.CalorificController.SetValveState("source-c", 40.0)
+	services.CalorificController.Start(ctx)
+	defer services.CalorificController.Stop()
 
 	services.EvacuationPlanner = evacuation_planner.NewEvacuationPlanner(&cfg.EvacuationPlanner)
 	services.EvacuationPlanner.SetChannels(alarmChan, routeChan, broadcastChan)
@@ -144,7 +144,7 @@ func main() {
 	log.Printf("  EmergencyController:  running=%v", services.EmergencyController.IsRunning())
 	log.Printf("  FiberMonitor:         running=%v", services.FiberMonitor.IsRunning())
 	log.Printf("  CorrosionMonitor:     running=%v", services.CorrosionMonitor.IsRunning())
-	log.Printf("  CalorificControl:     running=%v", services.CalorificControl.IsRunning())
+	log.Printf("  CalorificController:     running=%v", services.CalorificController.IsRunning())
 	log.Printf("  EvacuationPlanner:    running=%v", services.EvacuationPlanner.IsRunning())
 	log.Println("========================")
 

@@ -229,4 +229,5 @@ type EvacuationPlannerConfig struct {
 	FireDoorMonitorTopic  string        `mapstructure:"fire_door_monitor_topic"`
 	MaxReplanAttempts     int           `mapstructure:"max_replan_attempts"`
 	ReplanCoolDown        time.Duration `mapstructure:"replan_cooldown"`
+	DijkstraWorkerCount   int           `mapstructure:"dijkstra_worker_count"`
 }

@@ -506,9 +506,9 @@ func (h *Handler) Health(c *gin.Context) {
 			"alarm_router":         services.AlarmRouter != nil && services.AlarmRouter.IsRunning(),
 			"leak_locator":         services.LeakLocator != nil && services.LeakLocator.IsRunning(),
 			"emergency_controller": services.EmergencyController != nil && services.EmergencyController.IsRunning(),
-			"fiber_monitor":        services.FiberMonitor != nil && services.FiberMonitor.IsRunning(),
-			"corrosion_monitor":    services.CorrosionMonitor != nil && services.CorrosionMonitor.IsRunning(),
-			"calorific_control":    services.CalorificControl != nil && services.CalorificControl.IsRunning(),
+			"fiber_monitor":        services.StructureMonitor != nil && services.StructureMonitor.IsRunning(),
+			"corrosion_predictor":  services.CorrosionPredictor != nil && services.CorrosionPredictor.IsRunning(),
+			"calorific_control":    services.CalorificController != nil && services.CalorificController.IsRunning(),
 			"evacuation_planner":   services.EvacuationPlanner != nil && services.EvacuationPlanner.IsRunning(),
 		},
 	}
@@ -571,8 +571,8 @@ func (h *Handler) ReceiveFiberData(c *gin.Context) {
 		return
 	}
 
-	if services.FiberMonitor != nil {
-		services.FiberMonitor.ProcessFiberData(&data)
+	if services.StructureMonitor != nil {
+		services.StructureMonitor.ProcessFiberData(&data)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "received"})
@@ -706,8 +706,8 @@ func (h *Handler) AddCorrosionInspection(c *gin.Context) {
 		data.InspectionDate = time.Now()
 	}
 
-	if services.CorrosionMonitor != nil {
-		services.CorrosionMonitor.ProcessInspectionData(&data)
+	if services.CorrosionPredictor != nil {
+		services.CorrosionPredictor.ProcessInspectionData(&data)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "received", "id": data.ID})
@@ -786,8 +786,8 @@ func (h *Handler) GetGasAnalyzers(c *gin.Context) {
 }
 
 func (h *Handler) GetGasValves(c *gin.Context) {
-	if services.CalorificControl != nil {
-		valves := services.CalorificControl.GetAllValveStates()
+	if services.CalorificController != nil {
+		valves := services.CalorificController.GetAllValveStates()
 		c.JSON(http.StatusOK, valves)
 		return
 	}
@@ -842,8 +842,8 @@ func (h *Handler) ReceiveGasComposition(c *gin.Context) {
 		data.Timestamp = time.Now()
 	}
 
-	if services.CalorificControl != nil {
-		services.CalorificControl.ProcessCompositionData(&data)
+	if services.CalorificController != nil {
+		services.CalorificController.ProcessCompositionData(&data)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "received"})
@@ -862,8 +862,8 @@ func (h *Handler) ControlGasValve(c *gin.Context) {
 		return
 	}
 
-	if services.CalorificControl != nil {
-		current := services.CalorificControl.GetValveState(valveID)
+	if services.CalorificController != nil {
+		current := services.CalorificController.GetValveState(valveID)
 		control := &models.GasValveControl{
 			ID:            uuid.New(),
 			ValveID:       valveID,
@@ -880,7 +880,7 @@ func (h *Handler) ControlGasValve(c *gin.Context) {
 		}
 
 		services.DB.SaveGasValveControl(control)
-		services.CalorificControl.SetValveState(valveID, req.TargetOpening)
+		services.CalorificController.SetValveState(valveID, req.TargetOpening)
 
 		c.JSON(http.StatusOK, gin.H{
 			"status":         "adjusted",

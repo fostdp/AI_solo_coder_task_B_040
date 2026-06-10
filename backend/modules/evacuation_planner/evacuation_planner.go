@@ -15,6 +15,22 @@ import (
 	"gas-monitoring-system/backend/services"
 )
 
+type DijkstraJob struct {
+	JobID      string
+	StartID    string
+	EndID      string
+	GraphNodes map[string]*models.GraphNode
+	GraphEdges map[string][]*models.GraphEdge
+	ResultChan chan DijkstraResult
+}
+
+type DijkstraResult struct {
+	JobID    string
+	Path     []string
+	Distance float64
+	Error    error
+}
+
 type EvacuationPlanner struct {
 	cfg              *config.EvacuationPlannerConfig
 	running          bool
@@ -39,6 +55,10 @@ type EvacuationPlanner struct {
 
 	stats            PlannerStats
 	statsMu          sync.Mutex
+
+	dijkstraJobs     chan DijkstraJob
+	workerCount      int
+	workersWG        sync.WaitGroup
 }
 
 type FireDoorStatus struct {
@@ -66,6 +86,11 @@ type distanceEntry struct {
 }
 
 func NewEvacuationPlanner(cfg *config.EvacuationPlannerConfig) *EvacuationPlanner {
+	workerCount := 3
+	if cfg.DijkstraWorkerCount > 0 {
+		workerCount = cfg.DijkstraWorkerCount
+	}
+
 	return &EvacuationPlanner{
 		cfg:             cfg,
 		graphNodes:      make(map[string]*models.GraphNode),
@@ -78,6 +103,8 @@ func NewEvacuationPlanner(cfg *config.EvacuationPlannerConfig) *EvacuationPlanne
 		dynamicEdges:    make(map[string]time.Time),
 		lastReplanTime:  make(map[string]time.Time),
 		stats:           PlannerStats{},
+		dijkstraJobs:    make(chan DijkstraJob, 100),
+		workerCount:     workerCount,
 	}
 }
 
@@ -166,17 +193,30 @@ func (ep *EvacuationPlanner) Start(ctx context.Context) {
 	}
 	ep.running = true
 
+	ep.startDijkstraWorkers(ctx)
 	go ep.alarmListener(ctx)
 	go ep.statsPrinter(ctx)
 	go ep.graphUpdater(ctx)
-	log.Println("[EvacuationPlanner] 疏散规划模块启动")
+	log.Printf("[EvacuationPlanner] 疏散规划模块启动 - Dijkstra Worker数量: %d", ep.workerCount)
 }
 
 func (ep *EvacuationPlanner) Stop() {
 	ep.mu.Lock()
-	defer ep.mu.Unlock()
-
+	if !ep.running {
+		ep.mu.Unlock()
+		return
+	}
 	ep.running = false
+
+	close(ep.dijkstraJobs)
+	ep.mu.Unlock()
+
+	ep.workersWG.Wait()
+
+	ep.mu.Lock()
+	ep.dijkstraJobs = make(chan DijkstraJob, 100)
+	ep.mu.Unlock()
+
 	log.Println("[EvacuationPlanner] 疏散规划模块停止")
 }
 
@@ -360,32 +400,47 @@ func (ep *EvacuationPlanner) positionToLatLng(position float64) (float64, float6
 
 func (ep *EvacuationPlanner) calculateEvacuationRoute(person *models.PersonLocation, alarm *models.Alarm) *models.EvacuationRoute {
 	ep.mu.RLock()
-	defer ep.mu.RUnlock()
-
 	startNode := ep.findNearestNode(person.Position, person.Latitude, person.Longitude)
 	if startNode == nil {
+		ep.mu.RUnlock()
 		log.Printf("[EvacuationPlanner] 无法找到人员附近节点")
 		return nil
 	}
 
-	bestExit := ""
-	bestDistance := math.Inf(1)
-	bestPath := []string{}
-
+	exitIDs := make([]string, 0, len(ep.exitPoints))
+	exitNodeIDs := make([]string, 0, len(ep.exitPoints))
 	for exitID, exit := range ep.exitPoints {
 		if exit.Status != "available" {
 			continue
 		}
-
 		exitNodeID := "exit_" + exitID
 		if _, exists := ep.graphNodes[exitNodeID]; !exists {
 			continue
 		}
+		exitIDs = append(exitIDs, exitID)
+		exitNodeIDs = append(exitNodeIDs, exitNodeID)
+	}
+	ep.mu.RUnlock()
 
-		path, distance := ep.dijkstra(startNode.ID, exitNodeID)
+	if len(exitIDs) == 0 {
+		log.Printf("[EvacuationPlanner] 无法找到可用疏散出口")
+		return nil
+	}
+
+	ctx := context.Background()
+	bestExit := ""
+	bestDistance := math.Inf(1)
+	bestPath := []string{}
+
+	for i, exitNodeID := range exitNodeIDs {
+		path, distance, err := ep.submitDijkstraJob(ctx, startNode.ID, exitNodeID)
+		if err != nil {
+			log.Printf("[EvacuationPlanner] Dijkstra计算失败: %v", err)
+			continue
+		}
 		if len(path) > 0 && distance < bestDistance {
 			bestDistance = distance
-			bestExit = exitID
+			bestExit = exitIDs[i]
 			bestPath = path
 		}
 	}
@@ -395,6 +450,7 @@ func (ep *EvacuationPlanner) calculateEvacuationRoute(person *models.PersonLocat
 		return nil
 	}
 
+	ep.mu.RLock()
 	routeNodes := ep.buildRouteNodes(bestPath)
 	estimatedTime := bestDistance / ep.cfg.PersonSpeedMetersPerMin
 
@@ -407,6 +463,7 @@ func (ep *EvacuationPlanner) calculateEvacuationRoute(person *models.PersonLocat
 	for _, exit := range ep.exitPoints {
 		exits = append(exits, *exit)
 	}
+	ep.mu.RUnlock()
 
 	return &models.EvacuationRoute{
 		ID:              uuid.New(),
@@ -435,6 +492,158 @@ func (ep *EvacuationPlanner) findNearestNode(position float64, lat, lng float64)
 	}
 
 	return nearest
+}
+
+func (ep *EvacuationPlanner) startDijkstraWorkers(ctx context.Context) {
+	for i := 0; i < ep.workerCount; i++ {
+		ep.workersWG.Add(1)
+		go ep.dijkstraWorker(ctx, i)
+	}
+}
+
+func (ep *EvacuationPlanner) dijkstraWorker(ctx context.Context, workerID int) {
+	defer ep.workersWG.Done()
+	log.Printf("[EvacuationPlanner] Dijkstra Worker %d 启动", workerID)
+
+	for job := range ep.dijkstraJobs {
+		select {
+		case <-ctx.Done():
+			log.Printf("[EvacuationPlanner] Dijkstra Worker %d 收到退出信号", workerID)
+			if job.ResultChan != nil {
+				job.ResultChan <- DijkstraResult{
+					JobID: job.JobID,
+					Error: ctx.Err(),
+				}
+				close(job.ResultChan)
+			}
+			return
+		default:
+		}
+
+		path, distance := ep.executeDijkstra(job.StartID, job.EndID, job.GraphNodes, job.GraphEdges)
+
+		result := DijkstraResult{
+			JobID:    job.JobID,
+			Path:     path,
+			Distance: distance,
+		}
+
+		if path == nil {
+			result.Error = fmt.Errorf("no path found from %s to %s", job.StartID, job.EndID)
+		}
+
+		if job.ResultChan != nil {
+			select {
+			case job.ResultChan <- result:
+			case <-ctx.Done():
+				return
+			}
+			close(job.ResultChan)
+		}
+	}
+
+	log.Printf("[EvacuationPlanner] Dijkstra Worker %d 退出", workerID)
+}
+
+func (ep *EvacuationPlanner) executeDijkstra(startID, endID string, graphNodes map[string]*models.GraphNode, graphEdges map[string][]*models.GraphEdge) ([]string, float64) {
+	distances := make(map[string]float64)
+	previous := make(map[string]string)
+	visited := make(map[string]bool)
+
+	for nodeID := range graphNodes {
+		distances[nodeID] = math.Inf(1)
+		previous[nodeID] = ""
+	}
+	distances[startID] = 0
+
+	for i := 0; i < len(graphNodes); i++ {
+		current := ""
+		minDist := math.Inf(1)
+
+		for nodeID, dist := range distances {
+			if !visited[nodeID] && dist < minDist {
+				minDist = dist
+				current = nodeID
+			}
+		}
+
+		if current == "" || current == endID {
+			break
+		}
+
+		visited[current] = true
+
+		for _, edge := range graphEdges[current] {
+			if edge.Blocked {
+				continue
+			}
+
+			neighbor := edge.To
+			if visited[neighbor] {
+				continue
+			}
+
+			alt := distances[current] + edge.Weight
+			if alt < distances[neighbor] {
+				distances[neighbor] = alt
+				previous[neighbor] = current
+			}
+		}
+	}
+
+	if math.IsInf(distances[endID], 1) {
+		return nil, math.Inf(1)
+	}
+
+	path := []string{}
+	current := endID
+	for current != "" {
+		path = append([]string{current}, path...)
+		current = previous[current]
+	}
+
+	return path, distances[endID]
+}
+
+func (ep *EvacuationPlanner) submitDijkstraJob(ctx context.Context, startID, endID string) ([]string, float64, error) {
+	ep.mu.RLock()
+	graphNodes := make(map[string]*models.GraphNode, len(ep.graphNodes))
+	for k, v := range ep.graphNodes {
+		graphNodes[k] = v
+	}
+
+	graphEdges := make(map[string][]*models.GraphEdge, len(ep.graphEdges))
+	for k, v := range ep.graphEdges {
+		edgesCopy := make([]*models.GraphEdge, len(v))
+		copy(edgesCopy, v)
+		graphEdges[k] = edgesCopy
+	}
+	ep.mu.RUnlock()
+
+	jobID := uuid.New().String()
+	resultChan := make(chan DijkstraResult, 1)
+
+	job := DijkstraJob{
+		JobID:      jobID,
+		StartID:    startID,
+		EndID:      endID,
+		GraphNodes: graphNodes,
+		GraphEdges: graphEdges,
+		ResultChan: resultChan,
+	}
+
+	select {
+	case ep.dijkstraJobs <- job:
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
+
+	select {
+	case result := <-resultChan:
+		return result.Path, result.Distance, result.Error
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
 }
 
 func (ep *EvacuationPlanner) dijkstra(startID, endID string) ([]string, float64) {

@@ -409,8 +409,8 @@ func (m *MQTTService) handleFiberData(client mqtt.Client, msg mqtt.Message) {
 		data.Timestamp = time.Now()
 	}
 
-	if services.FiberMonitor != nil {
-		go services.FiberMonitor.ProcessFiberData(&data)
+	if services.StructureMonitor != nil {
+		go services.StructureMonitor.ProcessFiberData(&data)
 	}
 }
 
@@ -425,8 +425,8 @@ func (m *MQTTService) handleCompositionData(client mqtt.Client, msg mqtt.Message
 		data.Timestamp = time.Now()
 	}
 
-	if services.CalorificControl != nil {
-		go services.CalorificControl.ProcessCompositionData(&data)
+	if services.CalorificController != nil {
+		go services.CalorificController.ProcessCompositionData(&data)
 	}
 }
 

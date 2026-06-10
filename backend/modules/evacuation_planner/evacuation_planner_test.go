@@ -24,6 +24,7 @@ func newTestEvacuationConfig() *config.EvacuationPlannerConfig {
 		BroadcastInterval:        2 * time.Second,
 		GraphUpdateInterval:      10 * time.Second,
 		StatsInterval:            10 * time.Second,
+		DijkstraWorkerCount:      3,
 	}
 }
 
@@ -1500,4 +1501,438 @@ func TestMultipleFireDoorUpdates(t *testing.T) {
 
 	t.Logf("多防火门更新验证 - 总数:%d, 关闭:%d, 打开:%d, 拓扑版本:%d",
 		doorCount, closedCount, openCount, version)
+}
+
+func TestDijkstraWorkerPoolInitialization(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.DijkstraWorkerCount = 3
+	ep := NewEvacuationPlanner(cfg)
+
+	if ep.workerCount != 3 {
+		t.Errorf("Worker数量错误: 期望=3, 实际=%d", ep.workerCount)
+	}
+
+	if ep.dijkstraJobs == nil {
+		t.Error("dijkstraJobs channel未初始化")
+	}
+
+	cfg2 := newTestEvacuationConfig()
+	cfg2.DijkstraWorkerCount = 0
+	ep2 := NewEvacuationPlanner(cfg2)
+
+	if ep2.workerCount != 3 {
+		t.Errorf("默认Worker数量应为3: 实际=%d", ep2.workerCount)
+	}
+}
+
+func TestSubmitDijkstraJob(t *testing.T) {
+	ep := setupTestPlanner(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ep.Start(ctx)
+	defer cancel()
+	defer ep.Stop()
+
+	startNode := ep.findNearestNode(100.0, 0, 0)
+	if startNode == nil {
+		t.Fatal("无法找到起始节点")
+	}
+
+	exitNodeID := "exit_EXIT_001"
+
+	path, distance, err := ep.submitDijkstraJob(ctx, startNode.ID, exitNodeID)
+	if err != nil {
+		t.Fatalf("Dijkstra任务失败: %v", err)
+	}
+
+	if len(path) < 2 {
+		t.Error("路径至少包含起点和终点")
+	}
+
+	if path[0] != startNode.ID {
+		t.Errorf("路径起点错误: 期望=%s, 实际=%s", startNode.ID, path[0])
+	}
+
+	if path[len(path)-1] != exitNodeID {
+		t.Errorf("路径终点错误: 期望=%s, 实际=%s", exitNodeID, path[len(path)-1])
+	}
+
+	if distance <= 0 {
+		t.Errorf("距离应为正数: %.1f", distance)
+	}
+
+	t.Logf("Dijkstra任务成功 - 路径长度:%d, 距离:%.1f米", len(path), distance)
+}
+
+func TestConcurrentDijkstraJobs(t *testing.T) {
+	ep := setupTestPlanner(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ep.Start(ctx)
+	defer cancel()
+	defer ep.Stop()
+
+	numJobs := 20
+	var wg sync.WaitGroup
+	wg.Add(numJobs)
+
+	startNode := ep.findNearestNode(500.0, 0, 0)
+	if startNode == nil {
+		t.Fatal("无法找到起始节点")
+	}
+
+	errors := make(chan error, numJobs)
+	results := make(chan float64, numJobs)
+
+	for i := 0; i < numJobs; i++ {
+		go func(jobID int) {
+			defer wg.Done()
+
+			exitID := "exit_EXIT_001"
+			if jobID%3 == 1 {
+				exitID = "exit_EXIT_002"
+			} else if jobID%3 == 2 {
+				exitID = "exit_EXIT_003"
+			}
+
+			path, distance, err := ep.submitDijkstraJob(ctx, startNode.ID, exitID)
+			if err != nil {
+				errors <- err
+				return
+			}
+
+			if len(path) < 2 {
+				errors <- fmt.Errorf("任务%d: 路径太短", jobID)
+				return
+			}
+
+			results <- distance
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+	close(results)
+
+	errorCount := 0
+	for err := range errors {
+		t.Errorf("并发任务错误: %v", err)
+		errorCount++
+	}
+
+	if errorCount > 0 {
+		t.Fatalf("并发任务失败率过高: %d/%d", errorCount, numJobs)
+	}
+
+	resultCount := 0
+	for dist := range results {
+		if dist <= 0 {
+			t.Error("距离应为正数")
+		}
+		resultCount++
+	}
+
+	if resultCount != numJobs {
+		t.Errorf("结果数量不匹配: 期望=%d, 实际=%d", numJobs, resultCount)
+	}
+
+	t.Logf("并发Dijkstra任务完成 - 总数:%d, 成功:%d", numJobs, resultCount)
+}
+
+func TestDijkstraWorkerContextCancellation(t *testing.T) {
+	ep := setupTestPlanner(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ep.Start(ctx)
+
+	startNode := ep.findNearestNode(100.0, 0, 0)
+	if startNode == nil {
+		t.Fatal("无法找到起始节点")
+	}
+
+	cancel()
+
+	time.Sleep(100 * time.Millisecond)
+
+	_, _, err := ep.submitDijkstraJob(ctx, startNode.ID, "exit_EXIT_001")
+	if err == nil {
+		t.Error("Context取消后应返回错误")
+	}
+
+	ep.Stop()
+	t.Log("Context取消测试通过")
+}
+
+func TestDijkstraWorkerLifecycle(t *testing.T) {
+	ep := setupTestPlanner(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if ep.IsRunning() {
+		t.Error("初始状态应为未运行")
+	}
+
+	ep.Start(ctx)
+	if !ep.IsRunning() {
+		t.Error("Start后应为运行状态")
+	}
+
+	startNode := ep.findNearestNode(100.0, 0, 0)
+	_, _, err := ep.submitDijkstraJob(ctx, startNode.ID, "exit_EXIT_001")
+	if err != nil {
+		t.Fatalf("运行时应能提交任务: %v", err)
+	}
+
+	ep.Stop()
+	if ep.IsRunning() {
+		t.Error("Stop后应为未运行状态")
+	}
+
+	if ep.dijkstraJobs == nil {
+		t.Error("Stop后应重新初始化channel")
+	}
+
+	ep.Start(ctx)
+	defer cancel()
+	defer ep.Stop()
+
+	_, _, err = ep.submitDijkstraJob(ctx, startNode.ID, "exit_EXIT_001")
+	if err != nil {
+		t.Fatalf("重新启动后应能提交任务: %v", err)
+	}
+
+	t.Log("Worker生命周期测试通过")
+}
+
+func TestDijkstraJobType(t *testing.T) {
+	job := DijkstraJob{
+		JobID:      "test_job_001",
+		StartID:    "node_0",
+		EndID:      "node_5",
+		ResultChan: make(chan DijkstraResult, 1),
+	}
+
+	if job.JobID != "test_job_001" {
+		t.Errorf("JobID错误: %s", job.JobID)
+	}
+
+	if job.StartID != "node_0" {
+		t.Errorf("StartID错误: %s", job.StartID)
+	}
+
+	if job.EndID != "node_5" {
+		t.Errorf("EndID错误: %s", job.EndID)
+	}
+
+	if job.ResultChan == nil {
+		t.Error("ResultChan不应为nil")
+	}
+
+	result := DijkstraResult{
+		JobID:    "test_job_001",
+		Path:     []string{"node_0", "node_1", "node_5"},
+		Distance: 200.0,
+		Error:    nil,
+	}
+
+	if result.JobID != "test_job_001" {
+		t.Errorf("Result JobID错误: %s", result.JobID)
+	}
+
+	if len(result.Path) != 3 {
+		t.Errorf("Path长度错误: %d", len(result.Path))
+	}
+
+	if math.Abs(result.Distance-200.0) > 0.01 {
+		t.Errorf("Distance错误: %.1f", result.Distance)
+	}
+
+	if result.Error != nil {
+		t.Errorf("Error应为nil: %v", result.Error)
+	}
+
+	t.Log("DijkstraJob和DijkstraResult类型测试通过")
+}
+
+func TestDijkstraWorkerPoolPerformance(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.DijkstraWorkerCount = 5
+	ep := NewEvacuationPlanner(cfg)
+	ep.SetCorridorPoints(newTestCorridorPoints())
+
+	exit1 := &models.ExitPoint{
+		ID: "EXIT_001", Position: 50.0,
+		Latitude: 39.90425, Longitude: 116.40745,
+		Name: "北口", Status: "available", Capacity: 50,
+	}
+	exit2 := &models.ExitPoint{
+		ID: "EXIT_002", Position: 550.0,
+		Latitude: 39.90475, Longitude: 116.40795,
+		Name: "中间口", Status: "available", Capacity: 30,
+	}
+	exit3 := &models.ExitPoint{
+		ID: "EXIT_003", Position: 950.0,
+		Latitude: 39.90515, Longitude: 116.40835,
+		Name: "南口", Status: "available", Capacity: 40,
+	}
+
+	ep.AddExitPoint(exit1)
+	ep.AddExitPoint(exit2)
+	ep.AddExitPoint(exit3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ep.Start(ctx)
+	defer cancel()
+	defer ep.Stop()
+
+	numJobs := 100
+	startTime := time.Now()
+
+	var wg sync.WaitGroup
+	wg.Add(numJobs)
+
+	successCount := int64(0)
+	var mu sync.Mutex
+
+	for i := 0; i < numJobs; i++ {
+		go func(jobID int) {
+			defer wg.Done()
+
+			startPos := 100.0 + float64(jobID%10)*80.0
+			startNode := ep.findNearestNode(startPos, 0, 0)
+			if startNode == nil {
+				return
+			}
+
+			exitID := "exit_EXIT_001"
+			if jobID%3 == 1 {
+				exitID = "exit_EXIT_002"
+			} else if jobID%3 == 2 {
+				exitID = "exit_EXIT_003"
+			}
+
+			path, distance, err := ep.submitDijkstraJob(ctx, startNode.ID, exitID)
+			if err == nil && len(path) > 0 && distance > 0 {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(startTime)
+
+	successRate := float64(successCount) / float64(numJobs) * 100
+	if successRate < 95 {
+		t.Errorf("成功率过低: %.1f%% (%d/%d)", successRate, successCount, numJobs)
+	}
+
+	avgTime := duration / time.Duration(numJobs)
+	if avgTime > 20*time.Millisecond {
+		t.Logf("性能提示: 平均任务时间%v，可能需要优化", avgTime)
+	}
+
+	t.Logf("Worker池性能测试 - Worker数:5, 任务数:%d, 成功率:%.1f%%, 总耗时:%v, 平均:%v",
+		numJobs, successRate, duration, avgTime)
+}
+
+func TestCalculateEvacuationRouteWithWorkers(t *testing.T) {
+	ep := setupTestPlanner(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ep.Start(ctx)
+	defer cancel()
+	defer ep.Stop()
+
+	alarm := &models.Alarm{
+		ID:       uuid.New(),
+		DeviceID: "LASER_001",
+		Level:    3,
+	}
+
+	person := &models.PersonLocation{
+		PersonID:  "P_WORKER_TEST",
+		Position:  300.0,
+		Latitude:  39.9045,
+		Longitude: 116.4077,
+		FireZone:  "ZONE_1",
+		Timestamp: time.Now(),
+		Status:    "active",
+	}
+
+	route := ep.calculateEvacuationRoute(person, alarm)
+	if route == nil {
+		t.Fatal("使用Worker池计算路线失败")
+	}
+
+	if route.TotalDistance <= 0 {
+		t.Error("疏散距离应为正数")
+	}
+
+	if route.EstimatedTime <= 0 {
+		t.Error("预计疏散时间应为正数")
+	}
+
+	if len(route.Path) < 2 {
+		t.Error("路径至少包含起点和终点")
+	}
+
+	t.Logf("Worker池路线计算成功 - 距离:%.1f米, 时间:%.1f分钟, 路径节点:%d",
+		route.TotalDistance, route.EstimatedTime, len(route.Path))
+}
+
+func TestDijkstraWorkerJobQueue(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.DijkstraWorkerCount = 1
+	ep := NewEvacuationPlanner(cfg)
+	ep.SetCorridorPoints(newTestCorridorPoints())
+
+	exit1 := &models.ExitPoint{
+		ID: "EXIT_001", Position: 50.0,
+		Latitude: 39.90425, Longitude: 116.40745,
+		Name: "北口", Status: "available", Capacity: 50,
+	}
+	ep.AddExitPoint(exit1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ep.Start(ctx)
+	defer cancel()
+	defer ep.Stop()
+
+	startNode := ep.findNearestNode(500.0, 0, 0)
+	if startNode == nil {
+		t.Fatal("无法找到起始节点")
+	}
+
+	jobCount := 10
+	results := make([]DijkstraResult, jobCount)
+	var wg sync.WaitGroup
+	wg.Add(jobCount)
+
+	for i := 0; i < jobCount; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			path, dist, err := ep.submitDijkstraJob(ctx, startNode.ID, "exit_EXIT_001")
+			results[idx] = DijkstraResult{
+				JobID:    fmt.Sprintf("job_%d", idx),
+				Path:     path,
+				Distance: dist,
+				Error:    err,
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, result := range results {
+		if result.Error != nil {
+			t.Errorf("任务%d失败: %v", i, result.Error)
+		}
+		if len(result.Path) == 0 {
+			t.Errorf("任务%d路径为空", i)
+		}
+	}
+
+	t.Log("单Worker队列处理测试通过 - 10个任务全部完成")
 }
