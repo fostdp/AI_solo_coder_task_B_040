@@ -213,6 +213,8 @@ type EvacuationRoute struct {
 	ExitPoints  []ExitPoint `json:"exit_points"`
 	BlockedSegments []string `json:"blocked_segments"`
 	Status      string    `json:"status"`
+	IsReplan    bool      `json:"is_replan"`
+	OriginalRoute *EvacuationRoute `json:"original_route,omitempty"`
 }
 
 type RouteNode struct {

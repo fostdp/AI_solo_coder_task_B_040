@@ -32,8 +32,22 @@ type EvacuationPlanner struct {
 	blockedSegments  map[string]bool
 	corridorPoints   []models.PipeCorridorPoint
 
+	fireDoors        map[string]*FireDoorStatus
+	dynamicEdges     map[string]time.Time
+	lastReplanTime   map[string]time.Time
+	topologyVersion  int64
+
 	stats            PlannerStats
 	statsMu          sync.Mutex
+}
+
+type FireDoorStatus struct {
+	DoorID       string
+	Position     float64
+	IsOpen       bool
+	LastUpdated  time.Time
+	EdgeFrom     string
+	EdgeTo       string
 }
 
 type PlannerStats struct {
@@ -60,6 +74,9 @@ func NewEvacuationPlanner(cfg *config.EvacuationPlannerConfig) *EvacuationPlanne
 		personLocations: make(map[string]*models.PersonLocation),
 		activeRoutes:    make(map[uuid.UUID]*models.EvacuationRoute),
 		blockedSegments: make(map[string]bool),
+		fireDoors:       make(map[string]*FireDoorStatus),
+		dynamicEdges:    make(map[string]time.Time),
+		lastReplanTime:  make(map[string]time.Time),
 		stats:           PlannerStats{},
 	}
 }
@@ -525,6 +542,10 @@ func (ep *EvacuationPlanner) assignRoute(person *models.PersonLocation, route *m
 	}
 }
 
+func getPersonIDFromRoute(route *models.EvacuationRoute) string {
+	return fmt.Sprintf("route_%s", route.ID.String()[:8])
+}
+
 func (ep *EvacuationPlanner) sendEvacuationMessages(person *models.PersonLocation, route *models.EvacuationRoute, fireZone string) {
 	messages := []*models.BroadcastMessage{
 		{
@@ -629,6 +650,9 @@ func (ep *EvacuationPlanner) graphUpdater(ctx context.Context) {
 	ticker := time.NewTicker(ep.cfg.GraphUpdateInterval)
 	defer ticker.Stop()
 
+	topologyTicker := time.NewTicker(ep.getTopologyCheckInterval())
+	defer topologyTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -643,8 +667,236 @@ func (ep *EvacuationPlanner) graphUpdater(ctx context.Context) {
 			}
 
 			ep.cleanupExpiredRoutes()
+		case <-topologyTicker.C:
+			ep.mu.RLock()
+			running := ep.running
+			ep.mu.RUnlock()
+
+			if !running {
+				return
+			}
+
+			if ep.checkTopologyChanges() {
+				ep.triggerRouteReplan()
+			}
 		}
 	}
+}
+
+func (ep *EvacuationPlanner) getTopologyCheckInterval() time.Duration {
+	if ep.cfg.TopologyCheckInterval > 0 {
+		return ep.cfg.TopologyCheckInterval
+	}
+	return 5 * time.Second
+}
+
+func (ep *EvacuationPlanner) UpdateFireDoorStatus(doorID string, position float64, isOpen bool) {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	door, exists := ep.fireDoors[doorID]
+	if !exists {
+		door = &FireDoorStatus{
+			DoorID:   doorID,
+			Position: position,
+		}
+		ep.fireDoors[doorID] = door
+
+		ep.attachDoorToEdges(door)
+	}
+
+	oldStatus := door.IsOpen
+	door.IsOpen = isOpen
+	door.LastUpdated = time.Now()
+
+	if oldStatus != isOpen {
+		ep.topologyVersion++
+		ep.updateEdgeBlockedStatus(door)
+
+		edgeKey := fmt.Sprintf("%s_%s", door.EdgeFrom, door.EdgeTo)
+		ep.dynamicEdges[edgeKey] = time.Now()
+
+		log.Printf("[EvacuationPlanner] 防火门状态变化 - 门:%s, 位置:%.1fm, 状态:%s→%s, 拓扑版本:%d",
+			doorID, position, boolToStatus(oldStatus), boolToStatus(isOpen), ep.topologyVersion)
+
+		if services.WebSocket != nil {
+			event := map[string]interface{}{
+				"door_id":          doorID,
+				"position":         position,
+				"is_open":          isOpen,
+				"topology_version": ep.topologyVersion,
+				"updated_at":       door.LastUpdated,
+			}
+			services.WebSocket.Broadcast("fire_door_status", event)
+		}
+	}
+}
+
+func (ep *EvacuationPlanner) attachDoorToEdges(door *FireDoorStatus) {
+	var nearestNode1, nearestNode2 *models.GraphNode
+	minDist1 := math.Inf(1)
+	minDist2 := math.Inf(1)
+
+	for _, node := range ep.graphNodes {
+		dist := math.Abs(node.Position - door.Position)
+		if dist < minDist1 {
+			minDist2 = minDist1
+			nearestNode2 = nearestNode1
+			minDist1 = dist
+			nearestNode1 = node
+		} else if dist < minDist2 {
+			minDist2 = dist
+			nearestNode2 = node
+		}
+	}
+
+	if nearestNode1 != nil && nearestNode2 != nil {
+		if nearestNode1.Position < nearestNode2.Position {
+			door.EdgeFrom = nearestNode1.ID
+			door.EdgeTo = nearestNode2.ID
+		} else {
+			door.EdgeFrom = nearestNode2.ID
+			door.EdgeTo = nearestNode1.ID
+		}
+	}
+}
+
+func (ep *EvacuationPlanner) updateEdgeBlockedStatus(door *FireDoorStatus) {
+	if door.EdgeFrom == "" || door.EdgeTo == "" {
+		return
+	}
+
+	blocked := !door.IsOpen
+
+	for _, edge := range ep.graphEdges[door.EdgeFrom] {
+		if edge.To == door.EdgeTo {
+			edge.Blocked = blocked
+		}
+	}
+
+	for _, edge := range ep.graphEdges[door.EdgeTo] {
+		if edge.To == door.EdgeFrom {
+			edge.Blocked = blocked
+		}
+	}
+}
+
+func (ep *EvacuationPlanner) checkTopologyChanges() bool {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+
+	if len(ep.activeRoutes) == 0 {
+		return false
+	}
+
+	checkInterval := ep.getTopologyCheckInterval()
+	cutoff := time.Now().Add(-checkInterval * 2)
+
+	for _, t := range ep.dynamicEdges {
+		if t.After(cutoff) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (ep *EvacuationPlanner) triggerRouteReplan() {
+	ep.mu.Lock()
+	activeRoutes := make([]*models.EvacuationRoute, 0, len(ep.activeRoutes))
+	for _, route := range ep.activeRoutes {
+		if route.Status == "active" {
+			activeRoutes = append(activeRoutes, route)
+		}
+	}
+	personLocations := make(map[string]*models.PersonLocation)
+	for k, v := range ep.personLocations {
+		personLocations[k] = v
+	}
+	ep.mu.Unlock()
+
+	coolDown := ep.cfg.ReplanCoolDown
+	if coolDown <= 0 {
+		coolDown = 10 * time.Second
+	}
+
+	now := time.Now()
+	maxAttempts := ep.cfg.MaxReplanAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+
+	replanCount := 0
+	for _, route := range activeRoutes {
+		person, exists := personLocations[getPersonIDFromRoute(route)]
+		if !exists {
+			continue
+		}
+
+		lastReplan, hasReplan := ep.lastReplanTime[person.PersonID]
+		if hasReplan && now.Sub(lastReplan) < coolDown {
+			continue
+		}
+
+		alarm := &models.Alarm{
+			ID:       route.AlarmID,
+			DeviceID: "replan_trigger",
+			Level:    3,
+		}
+
+		newRoute := ep.calculateEvacuationRoute(person, alarm)
+		if newRoute != nil {
+			ep.mu.Lock()
+			ep.lastReplanTime[person.PersonID] = now
+			ep.mu.Unlock()
+
+			newRoute.ID = route.ID
+			newRoute.CalculatedAt = now
+			newRoute.IsReplan = true
+			newRoute.OriginalRoute = route
+
+			ep.saveRoute(newRoute)
+
+			if ep.routeChan != nil {
+				select {
+				case ep.routeChan <- newRoute:
+				default:
+				}
+			}
+
+			if services.WebSocket != nil {
+				services.WebSocket.Broadcast("evacuation_route_update", newRoute)
+			}
+
+			updateMsg := &models.BroadcastMessage{
+				ID:          uuid.New(),
+				FireZone:    route.FireZone,
+				Message:     fmt.Sprintf("人员%s，疏散路线已更新，请按照新指引撤离", person.PersonID),
+				MessageType: "update",
+				Priority:    1,
+				Timestamp:   now,
+				Broadcasted: false,
+			}
+			ep.broadcastMessage(updateMsg)
+
+			replanCount++
+			if replanCount >= maxAttempts {
+				break
+			}
+		}
+	}
+
+	if replanCount > 0 {
+		log.Printf("[EvacuationPlanner] 拓扑变化触发重规划 - 已更新%d条路线, 拓扑版本:%d",
+			replanCount, ep.topologyVersion)
+	}
+}
+
+func boolToStatus(b bool) string {
+	if b {
+		return "开启"
+	}
+	return "关闭"
 }
 
 func (ep *EvacuationPlanner) cleanupExpiredRoutes() {

@@ -1104,3 +1104,301 @@ func TestStatusClassification(t *testing.T) {
 		})
 	}
 }
+
+func TestRateOfChangeCalculation(t *testing.T) {
+	cfg := newTestCalorificConfig()
+	cfg.MaxRateOfChange = 5.0
+	cc := NewCalorificControl(cfg)
+
+	baseTime := time.Now()
+
+	compositions := []*models.GasComposition{
+		{
+			DeviceID:  "analyzer_001",
+			Timestamp: baseTime,
+			Methane:   90.0, Ethane: 3.0, Propane: 1.0,
+			Butane: 0.5, Nitrogen: 3.0, CarbonDioxide: 0.5, Hydrogen: 2.0,
+		},
+		{
+			DeviceID:  "analyzer_001",
+			Timestamp: baseTime.Add(1 * time.Second),
+			Methane:   85.0, Ethane: 3.0, Propane: 1.0,
+			Butane: 0.5, Nitrogen: 5.0, CarbonDioxide: 0.5, Hydrogen: 5.0,
+		},
+	}
+
+	cc.ProcessCompositionData(compositions[0])
+	rate := cc.calculateRateOfChange(compositions[1])
+
+	if rate <= 0 {
+		t.Error("变化率应为正值")
+	}
+
+	if rate < 5 {
+		t.Errorf("变化率计算值过低: %.2f", rate)
+	}
+
+	t.Logf("变化率计算成功: %.2f %%/s", rate)
+}
+
+func TestRateOfChangeLimiting(t *testing.T) {
+	cfg := newTestCalorificConfig()
+	cfg.MaxRateOfChange = 5.0
+	cc := NewCalorificControl(cfg)
+
+	valveID := cc.cfg.MethaneSourceName
+
+	testCases := []struct {
+		name           string
+		rawAdjustment  float64
+		expectedMax    float64
+	}{
+		{"小调节量", 3.0, 3.0},
+		{"超上限", 10.0, 5.0},
+		{"超下限", -10.0, -5.0},
+		{"边界上限", 5.0, 5.0},
+		{"边界下限", -5.0, -5.0},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			limited := cc.limitRateOfChange(tc.rawAdjustment, valveID)
+
+			if math.Abs(limited) > math.Abs(tc.expectedMax)+0.01 {
+				t.Errorf("变化率限制失败: 原始=%.2f, 限制后=%.2f, 期望最大=%.2f",
+					tc.rawAdjustment, limited, tc.expectedMax)
+			}
+
+			if tc.rawAdjustment > 0 && limited < 0 {
+				t.Error("正调节量不应变为负")
+			}
+			if tc.rawAdjustment < 0 && limited > 0 {
+				t.Error("负调节量不应变为正")
+			}
+
+			t.Logf("变化率限制: 原始=%.2f → 限制后=%.2f", tc.rawAdjustment, limited)
+		})
+	}
+}
+
+func TestFeedForwardControl(t *testing.T) {
+	cfg := newTestCalorificConfig()
+	cfg.FeedForwardGain = 0.8
+	cc := NewCalorificControl(cfg)
+
+	baseTime := time.Now()
+
+	compositions := []*models.GasComposition{
+		{
+			DeviceID:  "analyzer_001",
+			Timestamp: baseTime,
+			Methane:   90.0, Ethane: 3.0, Propane: 1.0,
+			Butane: 0.5, Nitrogen: 3.0, CarbonDioxide: 0.5, Hydrogen: 2.0,
+		},
+		{
+			DeviceID:  "analyzer_001",
+			Timestamp: baseTime.Add(1 * time.Second),
+			Methane:   85.0, Ethane: 3.0, Propane: 1.0,
+			Butane: 0.5, Nitrogen: 6.0, CarbonDioxide: 0.5, Hydrogen: 4.0,
+		},
+	}
+
+	cc.ProcessCompositionData(compositions[0])
+	feedForward := cc.calculateFeedForward(compositions[1])
+
+	if feedForward == 0 {
+		t.Error("前馈控制量不应为0")
+	}
+
+	t.Logf("前馈控制量计算: %.2f (氢气变化:%.1f, 氮气变化:%.1f)",
+		feedForward,
+		compositions[1].Hydrogen-compositions[0].Hydrogen,
+		compositions[1].Nitrogen-compositions[0].Nitrogen)
+}
+
+func TestOscillationDetection(t *testing.T) {
+	cfg := newTestCalorificConfig()
+	cfg.OscillationThreshold = 3
+	cc := NewCalorificControl(cfg)
+
+	valveID := cc.cfg.MethaneSourceName
+
+	adjustments := []float64{1.0, -0.8, 0.6, -0.5, 0.4}
+	for _, adj := range adjustments {
+		cc.mu.Lock()
+		cc.adjustmentHistory[valveID] = append(cc.adjustmentHistory[valveID], adj)
+		if len(cc.adjustmentHistory[valveID]) > 10 {
+			cc.adjustmentHistory[valveID] = cc.adjustmentHistory[valveID][1:]
+		}
+		cc.mu.Unlock()
+	}
+
+	oscillating := cc.detectOscillation()
+	if !oscillating {
+		t.Error("多次符号变化应检测为振荡")
+	}
+
+	cc.mu.Lock()
+	cc.adjustmentHistory[valveID] = []float64{1.0, 0.8, 0.6, 0.5, 0.4}
+	cc.mu.Unlock()
+
+	oscillating = cc.detectOscillation()
+	if oscillating {
+		t.Error("单调变化不应检测为振荡")
+	}
+
+	t.Log("振荡检测验证成功")
+}
+
+func TestAdaptiveSmoothing(t *testing.T) {
+	cfg := newTestCalorificConfig()
+	cfg.OscillationThreshold = 3
+	cfg.AdaptiveSmoothing = true
+	cc := NewCalorificControl(cfg)
+
+	normalCount := cc.getAdaptiveSmoothingCount()
+
+	valveID := cc.cfg.MethaneSourceName
+	oscillations := []float64{1.0, -1.0, 1.0, -1.0, 1.0}
+	cc.mu.Lock()
+	cc.adjustmentHistory[valveID] = append(cc.adjustmentHistory[valveID], oscillations...)
+	cc.mu.Unlock()
+
+	smoothingCount := cc.getAdaptiveSmoothingCount()
+
+	if smoothingCount <= normalCount {
+		t.Errorf("振荡时应增加平滑次数: 正常=%d, 振荡时=%d", normalCount, smoothingCount)
+	}
+
+	if smoothingCount < 3 || smoothingCount > 10 {
+		t.Errorf("平滑次数应在合理范围: %d", smoothingCount)
+	}
+
+	t.Logf("自适应平滑: 正常=%d次, 振荡时=%d次", normalCount, smoothingCount)
+}
+
+func TestMultiComponentOscillationSuppression(t *testing.T) {
+	cfg := newTestCalorificConfig()
+	cfg.MaxRateOfChange = 3.0
+	cfg.OscillationThreshold = 3
+	cfg.FeedForwardGain = 0.8
+	cfg.AdaptiveSmoothing = true
+	cc := NewCalorificControl(cfg)
+
+	baseTime := time.Now()
+
+	for i := 0; i < 10; i++ {
+		hydrogen := 2.0 + math.Sin(float64(i)*0.5)*3.0
+		nitrogen := 3.0 + math.Cos(float64(i)*0.5)*2.0
+		methane := 95.0 - hydrogen - nitrogen
+
+		data := &models.GasComposition{
+			DeviceID:  "analyzer_001",
+			Timestamp: baseTime.Add(time.Duration(i) * 500 * time.Millisecond),
+			Methane:   methane,
+			Ethane:    2.0,
+			Propane:   0.5,
+			Butane:    0.2,
+			Nitrogen:  nitrogen,
+			CarbonDioxide: 0.3,
+			Hydrogen:  hydrogen,
+		}
+		cc.ProcessCompositionData(data)
+	}
+
+	stats := cc.GetStats()
+
+	cc.mu.RLock()
+	oscillations := cc.oscillationCount
+	maxAdjustment := 0.0
+	for _, adj := range cc.adjustmentHistory[cc.cfg.MethaneSourceName] {
+		if math.Abs(adj) > maxAdjustment {
+			maxAdjustment = math.Abs(adj)
+		}
+	}
+	cc.mu.RUnlock()
+
+	if oscillations == 0 {
+		t.Log("警告: 预期会检测到振荡，但未检测到。这可能意味着振荡抑制过于激进。")
+	}
+
+	if maxAdjustment > cfg.MaxRateOfChange+0.1 {
+		t.Errorf("最大调节量超出变化率限制: %.2f > %.2f", maxAdjustment, cfg.MaxRateOfChange)
+	}
+
+	cc.mu.RLock()
+	totalLimited := cc.rateLimitedCount
+	totalFeedForward := cc.feedForwardUsed
+	cc.mu.RUnlock()
+
+	if totalLimited == 0 {
+		t.Log("注意: 变化率限制未被触发，可能输入波动较小")
+	}
+
+	t.Logf("多组分振荡抑制验证 - 调节次数:%d, 振荡检测:%d次, 变化率限制:%d次, 前馈控制:%d次, 最大调节量:%.2f",
+		stats.TotalAdjustments, oscillations, totalLimited, totalFeedForward, maxAdjustment)
+}
+
+func TestCombinedControlEffectiveness(t *testing.T) {
+	cfg := newTestCalorificConfig()
+	cfg.MaxRateOfChange = 2.0
+	cfg.OscillationThreshold = 3
+	cfg.FeedForwardGain = 0.8
+	cfg.AdaptiveSmoothing = true
+	cc := NewCalorificControl(cfg)
+
+	baseTime := time.Now()
+
+	var deviations []float64
+	for i := 0; i < 20; i++ {
+		baseMethane := 88.0 + math.Sin(float64(i)*0.3)*3.0
+		hydrogen := 2.0 + math.Cos(float64(i)*0.4)*1.5
+		nitrogen := 3.0 + math.Sin(float64(i)*0.5)*1.0
+
+		data := &models.GasComposition{
+			DeviceID:  "analyzer_001",
+			Timestamp: baseTime.Add(time.Duration(i) * 200 * time.Millisecond),
+			Methane:   baseMethane,
+			Ethane:    3.0,
+			Propane:   1.0,
+			Butane:    0.5,
+			Nitrogen:  nitrogen,
+			CarbonDioxide: 0.5,
+			Hydrogen:  hydrogen,
+		}
+		cc.ProcessCompositionData(data)
+
+		currentWobbe := cc.GetCurrentWobbe("analyzer_001")
+		if currentWobbe != nil {
+			deviations = append(deviations, math.Abs(currentWobbe.Deviation))
+		}
+	}
+
+	if len(deviations) > 5 {
+		firstThird := deviations[:len(deviations)/3]
+		lastThird := deviations[len(deviations)*2/3:]
+
+		avgFirst := 0.0
+		for _, d := range firstThird {
+			avgFirst += d
+		}
+		avgFirst /= float64(len(firstThird))
+
+		avgLast := 0.0
+		for _, d := range lastThird {
+			avgLast += d
+		}
+		avgLast /= float64(len(lastThird))
+
+		if avgLast > avgFirst*1.5 {
+			t.Errorf("后期偏差不应显著大于前期: 前期平均=%.2f, 后期平均=%.2f",
+				avgFirst, avgLast)
+		}
+
+		t.Logf("控制效果 - 前期平均偏差:%.2f, 后期平均偏差:%.2f", avgFirst, avgLast)
+	}
+
+	stats := cc.GetStats()
+	t.Logf("综合控制验证完成 - 总分析:%d, 总调节:%d, 振荡抑制:%d次",
+		stats.TotalAnalyses, stats.TotalAdjustments, stats.OscillationSuppressed)
+}

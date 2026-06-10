@@ -1067,3 +1067,437 @@ func TestPositionToLatLng(t *testing.T) {
 		})
 	}
 }
+
+func TestFireDoorStatusUpdate(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.FireDoorMonitorTopic = "facilities/fire-door/+/status"
+	ep := NewEvacuationPlanner(cfg)
+	ep.SetCorridorPoints(newTestCorridorPoints())
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, true)
+
+	ep.mu.RLock()
+	door, exists := ep.fireDoors["DOOR_001"]
+	ep.mu.RUnlock()
+
+	if !exists {
+		t.Fatal("防火门状态应被记录")
+	}
+
+	if !door.IsOpen {
+		t.Error("防火门初始状态应为打开")
+	}
+
+	if door.Position != 200.0 {
+		t.Errorf("防火门位置错误: %.1f", door.Position)
+	}
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, false)
+
+	ep.mu.RLock()
+	door, exists = ep.fireDoors["DOOR_001"]
+	ep.mu.RUnlock()
+
+	if !exists {
+		t.Fatal("防火门更新后仍应存在")
+	}
+
+	if door.IsOpen {
+		t.Error("防火门状态应更新为关闭")
+	}
+
+	if !door.LastUpdate.After(door.LastStatusChange) {
+		t.Error("更新时间应晚于状态变更时间")
+	}
+
+	t.Logf("防火门状态更新成功 - 门:%s, 位置:%.1fm, 状态:%v → %v",
+		door.DoorID, door.Position, true, false)
+}
+
+func TestTopologyChangeDetection(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.TopologyCheckInterval = 50 * time.Millisecond
+	ep := NewEvacuationPlanner(cfg)
+	ep.SetCorridorPoints(newTestCorridorPoints())
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, true)
+	ep.UpdateFireDoorStatus("DOOR_002", 500.0, true)
+
+	hasChanged := ep.checkTopologyChanges()
+	if hasChanged {
+		t.Error("初始设置防火门不应触发拓扑变化")
+	}
+
+	ep.mu.Lock()
+	ep.lastTopologyCheck = time.Now()
+	ep.mu.Unlock()
+
+	time.Sleep(60 * time.Millisecond)
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, false)
+
+	hasChanged = ep.checkTopologyChanges()
+	if !hasChanged {
+		t.Error("防火门关闭应检测到拓扑变化")
+	}
+
+	ep.mu.RLock()
+	version := ep.topologyVersion
+	ep.mu.RUnlock()
+
+	if version < 2 {
+		t.Errorf("拓扑版本应更新: %d", version)
+	}
+
+	t.Logf("拓扑变化检测成功 - 版本:%d, 变化:%v", version, hasChanged)
+}
+
+func TestRouteReplanOnTopologyChange(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.MaxReplanAttempts = 3
+	cfg.ReplanCoolDown = 100 * time.Millisecond
+	ep := setupTestPlanner(t)
+
+	exitPoint := &models.ExitPoint{
+		ID: "EXIT_001", Position: 900.0,
+		Latitude: 39.9051, Longitude: 116.4083,
+		Name: "主出口", Status: "available", Capacity: 50,
+	}
+	ep.AddExitPoint(exitPoint)
+
+	person := &models.PersonLocation{
+		PersonID:  "P_REPLAN_001",
+		Position:  100.0,
+		Latitude:  39.9043,
+		Longitude: 116.4075,
+		FireZone:  "ZONE_1",
+		Timestamp: time.Now(),
+		Status:    "evacuating",
+	}
+	ep.UpdatePersonLocation(person)
+
+	alarm := &models.Alarm{
+		ID:       "ALARM_REPLAN",
+		DeviceID: "LASER_001",
+		Level:    3,
+	}
+	ep.handleLevel3Alarm(alarm)
+
+	ep.mu.RLock()
+	originalRoute := ep.activeRoutes["P_REPLAN_001"]
+	ep.mu.RUnlock()
+
+	if originalRoute == nil {
+		t.Fatal("初始路线应存在")
+	}
+
+	ep.UpdateFireDoorStatus("DOOR_BLOCK", 500.0, false)
+
+	ep.mu.Lock()
+	ep.fireDoors["DOOR_BLOCK"].BlockedEdges = []string{"node_2-node_3", "node_3-node_4"}
+	ep.mu.Unlock()
+
+	ep.triggerRouteReplan()
+
+	ep.mu.RLock()
+	newRoute := ep.activeRoutes["P_REPLAN_001"]
+	ep.mu.RUnlock()
+
+	if newRoute == nil {
+		t.Fatal("重规划后路线应仍存在")
+	}
+
+	if !newRoute.IsReplan {
+		t.Error("重规划路线标记应为true")
+	}
+
+	if newRoute.OriginalRoute == nil {
+		t.Error("应保留原始路线引用")
+	}
+
+	t.Logf("路径重规划成功 - 原始距离:%.1fm, 新距离:%.1fm, 重规划:%v",
+		originalRoute.TotalDistance, newRoute.TotalDistance, newRoute.IsReplan)
+}
+
+func TestFireDoorBlockedEdges(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	ep := NewEvacuationPlanner(cfg)
+	ep.SetCorridorPoints(newTestCorridorPoints())
+
+	exitPoint := &models.ExitPoint{
+		ID: "EXIT_001", Position: 900.0,
+		Latitude: 39.9051, Longitude: 116.4083,
+		Name: "主出口", Status: "available", Capacity: 50,
+	}
+	ep.AddExitPoint(exitPoint)
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, true)
+
+	ep.mu.Lock()
+	ep.fireDoors["DOOR_001"].BlockedEdges = []string{"node_0-node_1"}
+	ep.mu.Unlock()
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, false)
+
+	ep.mu.RLock()
+	graph := ep.graph
+	ep.mu.RUnlock()
+
+	edgeBlocked := false
+	for from, edges := range graph.Edges {
+		for to, weight := range edges {
+			edgeKey := fmt.Sprintf("%s-%s", from, to)
+			reverseKey := fmt.Sprintf("%s-%s", to, from)
+			if (edgeKey == "node_0-node_1" || reverseKey == "node_0-node_1") && weight >= ep.cfg.MaxEdgeWeight {
+				edgeBlocked = true
+				break
+			}
+		}
+		if edgeBlocked {
+			break
+		}
+	}
+
+	if !edgeBlocked {
+		t.Error("防火门关闭时关联边应被阻断")
+	}
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, true)
+
+	ep.mu.RLock()
+	graph = ep.graph
+	ep.mu.RUnlock()
+
+	edgeRestored := false
+	for from, edges := range graph.Edges {
+		for to, weight := range edges {
+			edgeKey := fmt.Sprintf("%s-%s", from, to)
+			reverseKey := fmt.Sprintf("%s-%s", to, from)
+			if (edgeKey == "node_0-node_1" || reverseKey == "node_0-node_1") && weight < ep.cfg.MaxEdgeWeight {
+				edgeRestored = true
+				break
+			}
+		}
+		if edgeRestored {
+			break
+		}
+	}
+
+	if !edgeRestored {
+		t.Error("防火门打开时关联边应被恢复")
+	}
+
+	t.Log("防火门边阻断/恢复验证成功")
+}
+
+func TestTopologyVersionAndReplanCoolDown(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.ReplanCoolDown = 150 * time.Millisecond
+	cfg.MaxReplanAttempts = 3
+	ep := NewEvacuationPlanner(cfg)
+	ep.SetCorridorPoints(newTestCorridorPoints())
+
+	exitPoint := &models.ExitPoint{
+		ID: "EXIT_001", Position: 900.0,
+		Latitude: 39.9051, Longitude: 116.4083,
+		Name: "主出口", Status: "available", Capacity: 50,
+	}
+	ep.AddExitPoint(exitPoint)
+
+	person := &models.PersonLocation{
+		PersonID:  "P_COOLDOWN_001",
+		Position:  100.0,
+		Latitude:  39.9043,
+		Longitude: 116.4075,
+		FireZone:  "ZONE_1",
+		Timestamp: time.Now(),
+		Status:    "evacuating",
+	}
+	ep.UpdatePersonLocation(person)
+
+	alarm := &models.Alarm{
+		ID:       "ALARM_COOLDOWN",
+		DeviceID: "LASER_001",
+		Level:    3,
+	}
+	ep.handleLevel3Alarm(alarm)
+
+	ep.UpdateFireDoorStatus("DOOR_001", 200.0, false)
+	ep.triggerRouteReplan()
+
+	ep.mu.RLock()
+	replansAfterFirst := ep.replanCount
+	ep.mu.RUnlock()
+
+	ep.UpdateFireDoorStatus("DOOR_002", 500.0, false)
+	ep.triggerRouteReplan()
+
+	ep.mu.RLock()
+	replansAfterSecond := ep.replanCount
+	ep.mu.RUnlock()
+
+	if replansAfterSecond != replansAfterFirst {
+		t.Error("冷却期内不应重复重规划")
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	ep.UpdateFireDoorStatus("DOOR_003", 700.0, false)
+	ep.triggerRouteReplan()
+
+	ep.mu.RLock()
+	replansAfterThird := ep.replanCount
+	ep.mu.RUnlock()
+
+	if replansAfterThird <= replansAfterSecond {
+		t.Error("冷却期后应允许重规划")
+	}
+
+	ep.mu.RLock()
+	version := ep.topologyVersion
+	ep.mu.RUnlock()
+
+	if version < 4 {
+		t.Errorf("拓扑版本应随每次状态变化而增加: %d", version)
+	}
+
+	t.Logf("拓扑版本与冷却期验证 - 版本:%d, 重规划次数: 第一次:%d, 冷却期内:%d, 冷却后:%d",
+		version, replansAfterFirst, replansAfterSecond, replansAfterThird)
+}
+
+func TestRealTimeTopologyAwareness(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	cfg.TopologyCheckInterval = 30 * time.Millisecond
+	cfg.ReplanCoolDown = 50 * time.Millisecond
+	ep := setupTestPlanner(t)
+
+	exitPoint := &models.ExitPoint{
+		ID: "EXIT_001", Position: 900.0,
+		Latitude: 39.9051, Longitude: 116.4083,
+		Name: "主出口", Status: "available", Capacity: 50,
+	}
+	ep.AddExitPoint(exitPoint)
+
+	for i := 0; i < 3; i++ {
+		person := &models.PersonLocation{
+			PersonID:  fmt.Sprintf("P_TOPO_%03d", i),
+			Position:  100.0 + float64(i)*50.0,
+			Latitude:  39.9043,
+			Longitude: 116.4075,
+			FireZone:  "ZONE_1",
+			Timestamp: time.Now(),
+			Status:    "evacuating",
+		}
+		ep.UpdatePersonLocation(person)
+	}
+
+	alarm := &models.Alarm{
+		ID:       "ALARM_TOPO",
+		DeviceID: "LASER_001",
+		Level:    3,
+	}
+	ep.handleLevel3Alarm(alarm)
+
+	ep.UpdateFireDoorStatus("DOOR_DYNAMIC", 500.0, false)
+
+	ep.mu.Lock()
+	ep.fireDoors["DOOR_DYNAMIC"].BlockedEdges = []string{"node_3-node_4"}
+	ep.mu.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+
+	hasChanged := ep.checkTopologyChanges()
+	if !hasChanged {
+		t.Error("防火门关闭应触发拓扑变化检测")
+	}
+
+	ep.triggerRouteReplan()
+
+	ep.mu.RLock()
+	replanCount := 0
+	for _, route := range ep.activeRoutes {
+		if route.IsReplan {
+			replanCount++
+		}
+	}
+	topoVersion := ep.topologyVersion
+	ep.mu.RUnlock()
+
+	if replanCount == 0 {
+		t.Error("拓扑变化后应触发至少一次路线重规划")
+	}
+
+	t.Logf("实时拓扑感知验证 - 拓扑版本:%d, 重规划路线:%d/3条, 拓扑变化:%v",
+		topoVersion, replanCount, hasChanged)
+}
+
+func TestMultipleFireDoorUpdates(t *testing.T) {
+	cfg := newTestEvacuationConfig()
+	ep := NewEvacuationPlanner(cfg)
+	ep.SetCorridorPoints(newTestCorridorPoints())
+
+	fireDoors := []struct {
+		id       string
+		position float64
+	}{
+		{"DOOR_MULTI_001", 100.0},
+		{"DOOR_MULTI_002", 300.0},
+		{"DOOR_MULTI_003", 500.0},
+		{"DOOR_MULTI_004", 700.0},
+		{"DOOR_MULTI_005", 900.0},
+	}
+
+	for _, fd := range fireDoors {
+		ep.UpdateFireDoorStatus(fd.id, fd.position, true)
+	}
+
+	ep.mu.RLock()
+	doorCount := len(ep.fireDoors)
+	ep.mu.RUnlock()
+
+	if doorCount != 5 {
+		t.Errorf("防火门数量错误: 期望=5, 实际=%d", doorCount)
+	}
+
+	for _, fd := range fireDoors {
+		ep.UpdateFireDoorStatus(fd.id, fd.position, false)
+	}
+
+	ep.mu.RLock()
+	closedCount := 0
+	for _, door := range ep.fireDoors {
+		if !door.IsOpen {
+			closedCount++
+		}
+	}
+	ep.mu.RUnlock()
+
+	if closedCount != 5 {
+		t.Errorf("关闭的防火门数量错误: 期望=5, 实际=%d", closedCount)
+	}
+
+	for _, fd := range fireDoors {
+		ep.UpdateFireDoorStatus(fd.id, fd.position, true)
+	}
+
+	ep.mu.RLock()
+	openCount := 0
+	for _, door := range ep.fireDoors {
+		if door.IsOpen {
+			openCount++
+		}
+	}
+	version := ep.topologyVersion
+	ep.mu.RUnlock()
+
+	if openCount != 5 {
+		t.Errorf("重新打开的防火门数量错误: 期望=5, 实际=%d", openCount)
+	}
+
+	if version < 15 {
+		t.Errorf("多次状态变更后拓扑版本应足够大: %d", version)
+	}
+
+	t.Logf("多防火门更新验证 - 总数:%d, 关闭:%d, 打开:%d, 拓扑版本:%d",
+		doorCount, closedCount, openCount, version)
+}

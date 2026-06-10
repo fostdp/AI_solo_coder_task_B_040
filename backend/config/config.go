@@ -177,6 +177,10 @@ type FiberMonitorConfig struct {
 	BrillouinCoefficient  float64       `mapstructure:"brillouin_coefficient"`
 	AnomalyMergeDistance  float64       `mapstructure:"anomaly_merge_distance"`
 	StatsInterval         time.Duration `mapstructure:"stats_interval"`
+	StrainJumpThreshold   float64       `mapstructure:"strain_jump_threshold"`
+	BrillouinJumpThreshold float64      `mapstructure:"brillouin_jump_threshold"`
+	MaxInterpolationDistance float64    `mapstructure:"max_interpolation_distance"`
+	DataGapTimeout        time.Duration `mapstructure:"data_gap_timeout"`
 }
 
 type CorrosionMonitorConfig struct {
@@ -190,6 +194,9 @@ type CorrosionMonitorConfig struct {
 	HighPriorityRate      float64       `mapstructure:"high_priority_rate"`
 	MediumPriorityRate    float64       `mapstructure:"medium_priority_rate"`
 	StatsInterval         time.Duration `mapstructure:"stats_interval"`
+	RepairThresholdRatio  float64       `mapstructure:"repair_threshold_ratio"`
+	MinRepairThickness    float64       `mapstructure:"min_repair_thickness"`
+	ModelResetCoolDown    time.Duration `mapstructure:"model_reset_cooldown"`
 }
 
 type CalorificControlConfig struct {
@@ -203,6 +210,10 @@ type CalorificControlConfig struct {
 	HydrogenSourceName    string        `mapstructure:"hydrogen_source_name"`
 	NaturalGasSourceName  string        `mapstructure:"natural_gas_source_name"`
 	StatsInterval         time.Duration `mapstructure:"stats_interval"`
+	MaxRateOfChange       float64       `mapstructure:"max_rate_of_change"`
+	FeedForwardGain       float64       `mapstructure:"feed_forward_gain"`
+	OscillationThreshold  float64       `mapstructure:"oscillation_threshold"`
+	AdaptiveSmoothing     int           `mapstructure:"adaptive_smoothing"`
 }
 
 type EvacuationPlannerConfig struct {
@@ -214,4 +225,8 @@ type EvacuationPlannerConfig struct {
 	BroadcastInterval     time.Duration `mapstructure:"broadcast_interval"`
 	GraphUpdateInterval   time.Duration `mapstructure:"graph_update_interval"`
 	StatsInterval         time.Duration `mapstructure:"stats_interval"`
+	TopologyCheckInterval time.Duration `mapstructure:"topology_check_interval"`
+	FireDoorMonitorTopic  string        `mapstructure:"fire_door_monitor_topic"`
+	MaxReplanAttempts     int           `mapstructure:"max_replan_attempts"`
+	ReplanCoolDown        time.Duration `mapstructure:"replan_cooldown"`
 }

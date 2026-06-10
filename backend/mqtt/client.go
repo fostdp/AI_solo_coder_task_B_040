@@ -143,6 +143,11 @@ func (m *MQTTService) subscribeTopics() {
 	token = m.client.Subscribe(personTopic, 1, m.handlePersonLocation)
 	token.Wait()
 	log.Printf("Subscribed to person location topic: %s", personTopic)
+
+	fireDoorTopic := "facilities/fire-door/+/status"
+	token = m.client.Subscribe(fireDoorTopic, 1, m.handleFireDoorStatus)
+	token.Wait()
+	log.Printf("Subscribed to fire door status topic: %s", fireDoorTopic)
 }
 
 func (m *MQTTService) startRetryLoop() {
@@ -443,6 +448,33 @@ func (m *MQTTService) handlePersonLocation(client mqtt.Client, msg mqtt.Message)
 	if services.DB != nil {
 		go services.DB.SavePersonLocation(&data)
 	}
+}
+
+type FireDoorMQTTMessage struct {
+	DoorID   string  `json:"door_id"`
+	Position float64 `json:"position"`
+	IsOpen   bool    `json:"is_open"`
+}
+
+func (m *MQTTService) handleFireDoorStatus(client mqtt.Client, msg mqtt.Message) {
+	var data FireDoorMQTTMessage
+	if err := json.Unmarshal(msg.Payload(), &data); err != nil {
+		log.Printf("Failed to parse fire door status: %v", err)
+		return
+	}
+
+	if data.DoorID == "" {
+		topicParts := strings.Split(msg.Topic(), "/")
+		if len(topicParts) >= 3 {
+			data.DoorID = topicParts[2]
+		}
+	}
+
+	if services.EvacuationPlanner != nil {
+		go services.EvacuationPlanner.UpdateFireDoorStatus(data.DoorID, data.Position, data.IsOpen)
+	}
+
+	log.Printf("[MQTT] 防火门状态更新 - 门:%s, 位置:%.1fm, 状态:%v", data.DoorID, data.Position, data.IsOpen)
 }
 
 func (m *MQTTService) Publish(topic string, payload interface{}) error {

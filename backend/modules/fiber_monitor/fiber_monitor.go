@@ -26,8 +26,21 @@ type FiberMonitor struct {
 	detectors    map[string]*models.Detector
 	corridorPoints []models.PipeCorridorPoint
 
+	breakpoints  map[string][]*models.FiberBreakpoint
+	lastDataTime map[string]time.Time
+	interpolatedCount int64
+
 	stats        MonitorStats
 	statsMu      sync.Mutex
+}
+
+type FiberBreakpoint struct {
+	Position     float64
+	DetectedAt   time.Time
+	Type         string
+	Severity     string
+	Confidence   float64
+	Resolved     bool
 }
 
 type MonitorStats struct {
@@ -41,10 +54,12 @@ type MonitorStats struct {
 
 func NewFiberMonitor(cfg *config.FiberMonitorConfig) *FiberMonitor {
 	return &FiberMonitor{
-		cfg:         cfg,
-		fiberData:   make(map[string][]*models.FiberOpticData),
-		detectors:   make(map[string]*models.Detector),
-		stats:       MonitorStats{},
+		cfg:          cfg,
+		fiberData:    make(map[string][]*models.FiberOpticData),
+		detectors:    make(map[string]*models.Detector),
+		breakpoints:  make(map[string][]*FiberBreakpoint),
+		lastDataTime: make(map[string]time.Time),
+		stats:        MonitorStats{},
 	}
 }
 
@@ -99,6 +114,17 @@ func (fm *FiberMonitor) ProcessFiberData(data *models.FiberOpticData) {
 	fm.stats.LastSensedAt = data.Timestamp
 	fm.statsMu.Unlock()
 
+	fm.detectBreakpoint(data)
+
+	interpolated := fm.interpolateMissingData(data)
+	if interpolated != nil {
+		data = interpolated
+		data.Status = "interpolated"
+		fm.mu.Lock()
+		fm.interpolatedCount++
+		fm.mu.Unlock()
+	}
+
 	validated := fm.validate(data)
 	if !validated {
 		return
@@ -107,6 +133,144 @@ func (fm *FiberMonitor) ProcessFiberData(data *models.FiberOpticData) {
 	fm.storeFiberData(data)
 	fm.analyzeBrillouinShift(data)
 	fm.detectAnomaly(data)
+}
+
+func (fm *FiberMonitor) detectBreakpoint(data *models.FiberOpticData) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	history, exists := fm.fiberData[data.DeviceID]
+	if !exists || len(history) < 2 {
+		fm.lastDataTime[data.DeviceID] = data.Timestamp
+		return
+	}
+
+	lastData := history[len(history)-1]
+	prevData := history[len(history)-2]
+
+	strainJump := math.Abs(data.Strain - lastData.Strain)
+	brillouinJump := math.Abs(data.BrillouinShift - lastData.BrillouinShift)
+	timeGap := data.Timestamp.Sub(lastData.Timestamp)
+
+	isStrainJump := fm.cfg.StrainJumpThreshold > 0 && strainJump > fm.cfg.StrainJumpThreshold
+	isBrillouinJump := fm.cfg.BrillouinJumpThreshold > 0 && brillouinJump > fm.cfg.BrillouinJumpThreshold
+	isTimeout := fm.cfg.DataGapTimeout > 0 && timeGap > fm.cfg.DataGapTimeout
+
+	if isStrainJump || isBrillouinJump || isTimeout {
+		breakpoint := &FiberBreakpoint{
+			Position:   data.Position,
+			DetectedAt: time.Now(),
+			Type:       "fiber_break",
+			Severity:   "critical",
+			Confidence: 0.0,
+			Resolved:   false,
+		}
+
+		confidence := 0.0
+		if isStrainJump {
+			confidence += 0.4
+			breakpoint.Type = "strain_discontinuity"
+		}
+		if isBrillouinJump {
+			confidence += 0.4
+			breakpoint.Type = "brillouin_discontinuity"
+		}
+		if isTimeout {
+			confidence += 0.3
+			breakpoint.Type = "data_interruption"
+		}
+		if isStrainJump && isBrillouinJump {
+			breakpoint.Type = "fiber_break"
+			breakpoint.Severity = "critical"
+			confidence = 0.95
+		}
+
+		breakpoint.Confidence = math.Min(1.0, confidence)
+
+		if _, exists := fm.breakpoints[data.DeviceID]; !exists {
+			fm.breakpoints[data.DeviceID] = make([]*FiberBreakpoint, 0, 10)
+		}
+		fm.breakpoints[data.DeviceID] = append(fm.breakpoints[data.DeviceID], breakpoint)
+
+		log.Printf("[FiberMonitor] 光纤断点检测 - 设备:%s, 位置:%.1fm, 类型:%s, 置信度:%.1f%%, 应变跳变:%.1f, 频移跳变:%.1f, 时间间隔:%v",
+			data.DeviceID, data.Position, breakpoint.Type, breakpoint.Confidence*100,
+			strainJump, brillouinJump, timeGap)
+
+		if services.WebSocket != nil && breakpoint.Confidence >= 0.7 {
+			event := map[string]interface{}{
+				"device_id":   data.DeviceID,
+				"position":    data.Position,
+				"type":        breakpoint.Type,
+				"severity":    breakpoint.Severity,
+				"confidence":  breakpoint.Confidence,
+				"detected_at": breakpoint.DetectedAt,
+			}
+			services.WebSocket.Broadcast("fiber_breakpoint", event)
+		}
+	}
+
+	fm.lastDataTime[data.DeviceID] = data.Timestamp
+}
+
+func (fm *FiberMonitor) interpolateMissingData(data *models.FiberOpticData) *models.FiberOpticData {
+	if data.Status == "valid" || data.Strain != 0 || data.BrillouinShift != 0 {
+		return nil
+	}
+
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+
+	history, exists := fm.fiberData[data.DeviceID]
+	if !exists || len(history) < 2 {
+		return nil
+	}
+
+	var prevValid, nextValid *models.FiberOpticData
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Status != "interpolated" && history[i].Strain != 0 {
+			prevValid = history[i]
+			break
+		}
+	}
+
+	if prevValid == nil {
+		return nil
+	}
+
+	distance := math.Abs(data.Position - prevValid.Position)
+	if fm.cfg.MaxInterpolationDistance > 0 && distance > fm.cfg.MaxInterpolationDistance {
+		log.Printf("[FiberMonitor] 插值距离超出限制: %.1fm > %.1fm, 跳过插值",
+			distance, fm.cfg.MaxInterpolationDistance)
+		return nil
+	}
+
+	interpolated := &models.FiberOpticData{
+		DeviceID:     data.DeviceID,
+		Position:     data.Position,
+		Timestamp:    data.Timestamp,
+		Strain:       prevValid.Strain,
+		Temperature:  prevValid.Temperature,
+		BrillouinShift: prevValid.BrillouinShift,
+		Status:       "interpolated",
+	}
+
+	if len(history) >= 3 {
+		older := history[len(history)-2]
+		if older.Status != "interpolated" {
+			timeRatio := float64(data.Timestamp.Sub(prevValid.Timestamp).Milliseconds()) /
+				float64(prevValid.Timestamp.Sub(older.Timestamp).Milliseconds())
+			if timeRatio > 0 && timeRatio < 5 {
+				interpolated.Strain = prevValid.Strain + (prevValid.Strain-older.Strain)*timeRatio
+				interpolated.Temperature = prevValid.Temperature + (prevValid.Temperature-older.Temperature)*timeRatio
+				interpolated.BrillouinShift = prevValid.BrillouinShift + (prevValid.BrillouinShift-older.BrillouinShift)*timeRatio
+			}
+		}
+	}
+
+	log.Printf("[FiberMonitor] 数据插值 - 设备:%s, 位置:%.1fm, 原始应变:%.1f→插值应变:%.1f, 距离:%.1fm",
+		data.DeviceID, data.Position, data.Strain, interpolated.Strain, distance)
+
+	return interpolated
 }
 
 func (fm *FiberMonitor) validate(data *models.FiberOpticData) bool {

@@ -24,8 +24,23 @@ type CorrosionMonitor struct {
 	pipeData         map[string][]*models.PipeCorrosionData
 	corridorPoints   []models.PipeCorridorPoint
 
+	repairEvents     map[string][]*PipeRepairEvent
+	lastResetTime    map[string]time.Time
+	modelResetCount  int64
+
 	stats            MonitorStats
 	statsMu          sync.Mutex
+}
+
+type PipeRepairEvent struct {
+	PipeID        string
+	RepairDate    time.Time
+	Position      float64
+	OldThickness  float64
+	NewThickness  float64
+	ThicknessGain float64
+	Confidence    float64
+	ModelReset    bool
 }
 
 type MonitorStats struct {
@@ -40,9 +55,11 @@ type MonitorStats struct {
 
 func NewCorrosionMonitor(cfg *config.CorrosionMonitorConfig) *CorrosionMonitor {
 	return &CorrosionMonitor{
-		cfg:      cfg,
-		pipeData: make(map[string][]*models.PipeCorrosionData),
-		stats:    MonitorStats{},
+		cfg:          cfg,
+		pipeData:     make(map[string][]*models.PipeCorrosionData),
+		repairEvents: make(map[string][]*PipeRepairEvent),
+		lastResetTime: make(map[string]time.Time),
+		stats:        MonitorStats{},
 	}
 }
 
@@ -96,11 +113,121 @@ func (cm *CorrosionMonitor) ProcessInspectionData(data *models.PipeCorrosionData
 		return
 	}
 
+	if cm.detectRepairEvent(data) {
+		cm.resetModelForPipe(data.PipeID)
+	}
+
 	cm.storeInspectionData(data)
 	cm.calculateCorrosionRate(data)
 	cm.runPrediction(data)
 	cm.determineReplacementPriority(data)
 	cm.saveCorrosionData(data)
+}
+
+func (cm *CorrosionMonitor) detectRepairEvent(data *models.PipeCorrosionData) bool {
+	cm.mu.RLock()
+	history, exists := cm.pipeData[data.PipeID]
+	lastReset, hasReset := cm.lastResetTime[data.PipeID]
+	cm.mu.RUnlock()
+
+	if !exists || len(history) < 1 {
+		return false
+	}
+
+	if hasReset && cm.cfg.ModelResetCoolDown > 0 &&
+		time.Since(lastReset) < cm.cfg.ModelResetCoolDown {
+		return false
+	}
+
+	lastData := history[len(history)-1]
+	thicknessGain := data.CurrentWallThickness - lastData.CurrentWallThickness
+	gainRatio := thicknessGain / data.OriginalWallThickness
+
+	thresholdRatio := 0.1
+	if cm.cfg.RepairThresholdRatio > 0 {
+		thresholdRatio = cm.cfg.RepairThresholdRatio
+	}
+
+	minGain := 0.001
+	if cm.cfg.MinRepairThickness > 0 {
+		minGain = cm.cfg.MinRepairThickness
+	}
+
+	if thicknessGain <= 0 {
+		return false
+	}
+
+	isRepair := gainRatio >= thresholdRatio || thicknessGain >= minGain
+
+	if isRepair {
+		confidence := 0.0
+		if gainRatio >= thresholdRatio*2 {
+			confidence = 0.95
+		} else if gainRatio >= thresholdRatio*1.5 {
+			confidence = 0.8
+		} else {
+			confidence = 0.6
+		}
+
+		event := &PipeRepairEvent{
+			PipeID:        data.PipeID,
+			RepairDate:    time.Now(),
+			Position:      data.Position,
+			OldThickness:  lastData.CurrentWallThickness,
+			NewThickness:  data.CurrentWallThickness,
+			ThicknessGain: thicknessGain,
+			Confidence:    confidence,
+			ModelReset:    confidence >= 0.7,
+		}
+
+		cm.mu.Lock()
+		if _, exists := cm.repairEvents[data.PipeID]; !exists {
+			cm.repairEvents[data.PipeID] = make([]*PipeRepairEvent, 0, 10)
+		}
+		cm.repairEvents[data.PipeID] = append(cm.repairEvents[data.PipeID], event)
+		cm.mu.Unlock()
+
+		log.Printf("[CorrosionMonitor] 管道修复检测 - 管段:%s, 位置:%.1fm, 壁厚:%.3fm→%.3fm(+%.3fm), 增益比例:%.1f%%, 置信度:%.0f%%, 模型重置:%v",
+			data.PipeID, data.Position, lastData.CurrentWallThickness,
+			data.CurrentWallThickness, thicknessGain, gainRatio*100,
+			confidence*100, event.ModelReset)
+
+		if services.WebSocket != nil {
+			eventMsg := map[string]interface{}{
+				"pipe_id":        data.PipeID,
+				"position":       data.Position,
+				"old_thickness":  lastData.CurrentWallThickness,
+				"new_thickness":  data.CurrentWallThickness,
+				"thickness_gain": thicknessGain,
+				"confidence":     confidence,
+				"model_reset":    event.ModelReset,
+				"repair_date":    event.RepairDate,
+			}
+			services.WebSocket.Broadcast("pipe_repair_event", eventMsg)
+		}
+
+		return event.ModelReset
+	}
+
+	return false
+}
+
+func (cm *CorrosionMonitor) resetModelForPipe(pipeID string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	history, exists := cm.pipeData[pipeID]
+	if !exists || len(history) == 0 {
+		return
+	}
+
+	latest := history[len(history)-1]
+	cm.pipeData[pipeID] = []*models.PipeCorrosionData{latest}
+	cm.lastResetTime[pipeID] = time.Now()
+	cm.modelResetCount++
+
+	log.Printf("[CorrosionMonitor] 模型重置 - 管段:%s, 已重置历史数据, 保留最新数据作为新基线, 壁厚:%.3fm",
+		pipeID, latest.CurrentWallThickness)
 }
 
 func (cm *CorrosionMonitor) validate(data *models.PipeCorrosionData) bool {

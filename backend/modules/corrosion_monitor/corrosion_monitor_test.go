@@ -716,3 +716,296 @@ func TestMonitorLifecycle(t *testing.T) {
 
 	cancel()
 }
+
+func TestRepairEventDetection(t *testing.T) {
+	cfg := &config.CorrosionMonitorConfig{
+		MinWallThickness:      4.0,
+		CriticalWallThickness: 6.0,
+		PredictionHorizonMonths: 60,
+		ReplacementThreshold:  0.6,
+		HighPriorityRate:      0.5,
+		MediumPriorityRate:    0.2,
+		RepairThresholdRatio:  0.2,
+		MinRepairThickness:    2.0,
+		ModelResetCoolDown:    100 * time.Millisecond,
+	}
+
+	cm := NewCorrosionMonitor(cfg)
+
+	baseTime := time.Now()
+
+	for i := 0; i < 3; i++ {
+		data := &models.PipeCorrosionData{
+			PipeID:                "PIPE-001",
+			Position:              100,
+			OriginalWallThickness: 12.0,
+			CurrentWallThickness:  8.0 - float64(i)*0.3,
+			InspectionDate:        baseTime.AddDate(0, i, 0),
+			Environment:           models.EnviroIndustrial,
+		}
+		cm.ProcessInspectionData(data)
+	}
+
+	cm.mu.RLock()
+	beforeModel, hasModel := cm.pipeModels["PIPE-001"]
+	cm.mu.RUnlock()
+
+	if !hasModel {
+		t.Fatal("应存在管道腐蚀模型")
+	}
+
+	beforeLastThickness := beforeModel.LastMeasuredThickness
+
+	repairData := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  11.5,
+		InspectionDate:        baseTime.AddDate(0, 3, 0),
+		Environment:           models.EnviroIndustrial,
+	}
+
+	detected := cm.detectRepairEvent(repairData)
+	if !detected {
+		t.Fatal("应检测到管道修复事件，但未检测到")
+	}
+
+	cm.mu.RLock()
+	repairs, hasRepairs := cm.repairEvents["PIPE-001"]
+	cm.mu.RUnlock()
+
+	if !hasRepairs || len(repairs) == 0 {
+		t.Fatal("修复事件应被记录")
+	}
+
+	repair := repairs[len(repairs)-1]
+	if repair.ThicknessGain != 11.5-beforeLastThickness {
+		t.Errorf("壁厚增益计算错误: %.1f, 期望: %.1f",
+			repair.ThicknessGain, 11.5-beforeLastThickness)
+	}
+
+	if repair.GainRatio <= cfg.RepairThresholdRatio {
+		t.Errorf("增益比率应大于阈值: %.3f <= %.3f", repair.GainRatio, cfg.RepairThresholdRatio)
+	}
+
+	t.Logf("修复事件检测成功 - 壁厚增益:%.1fmm, 增益比率:%.1f%%, 重置前基线:%.1fmm",
+		repair.ThicknessGain, repair.GainRatio*100, beforeLastThickness)
+}
+
+func TestModelResetAfterRepair(t *testing.T) {
+	cfg := &config.CorrosionMonitorConfig{
+		MinWallThickness:      4.0,
+		CriticalWallThickness: 6.0,
+		PredictionHorizonMonths: 60,
+		ReplacementThreshold:  0.6,
+		HighPriorityRate:      0.5,
+		MediumPriorityRate:    0.2,
+		RepairThresholdRatio:  0.2,
+		MinRepairThickness:    2.0,
+		ModelResetCoolDown:    100 * time.Millisecond,
+	}
+
+	cm := NewCorrosionMonitor(cfg)
+
+	baseTime := time.Now()
+
+	for i := 0; i < 5; i++ {
+		data := &models.PipeCorrosionData{
+			PipeID:                "PIPE-001",
+			Position:              100,
+			OriginalWallThickness: 12.0,
+			CurrentWallThickness:  8.0 - float64(i)*0.5,
+			InspectionDate:        baseTime.AddDate(0, i, 0),
+			Environment:           models.EnviroIndustrial,
+		}
+		cm.ProcessInspectionData(data)
+	}
+
+	cm.mu.RLock()
+	beforeReset := cm.pipeModels["PIPE-001"]
+	beforeDataCount := len(beforeReset.MeasurementHistory)
+	beforeLastThickness := beforeReset.LastMeasuredThickness
+	cm.mu.RUnlock()
+
+	repairData := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  11.0,
+		InspectionDate:        baseTime.AddDate(0, 5, 0),
+		Environment:           models.EnviroIndustrial,
+	}
+	cm.ProcessInspectionData(repairData)
+
+	cm.mu.RLock()
+	afterReset, exists := cm.pipeModels["PIPE-001"]
+	cm.mu.RUnlock()
+
+	if !exists {
+		t.Fatal("模型重置后应仍存在管道模型")
+	}
+
+	if afterReset.LastMeasuredThickness != 11.0 {
+		t.Errorf("模型基线应重置为修复后的壁厚: %.1f, 实际: %.1f",
+			11.0, afterReset.LastMeasuredThickness)
+	}
+
+	if afterReset.IsReset != true {
+		t.Error("模型重置标志应为true")
+	}
+
+	if len(afterReset.MeasurementHistory) >= beforeDataCount {
+		t.Errorf("历史数据应被清理: %d >= %d",
+			len(afterReset.MeasurementHistory), beforeDataCount)
+	}
+
+	if len(afterReset.MeasurementHistory) < 1 {
+		t.Error("重置后应至少保留一条最新数据")
+	}
+
+	cm.mu.RLock()
+	resetCount := cm.resetCount
+	cm.mu.RUnlock()
+
+	if resetCount < 1 {
+		t.Error("重置计数应增加")
+	}
+
+	t.Logf("模型重置成功 - 重置前基线:%.1fmm → 重置后基线:%.1fmm, 历史数据:%d→%d条, 重置次数:%d",
+		beforeLastThickness, afterReset.LastMeasuredThickness,
+		beforeDataCount, len(afterReset.MeasurementHistory), resetCount)
+}
+
+func TestModelResetCoolDown(t *testing.T) {
+	cfg := &config.CorrosionMonitorConfig{
+		MinWallThickness:      4.0,
+		CriticalWallThickness: 6.0,
+		PredictionHorizonMonths: 60,
+		ReplacementThreshold:  0.6,
+		HighPriorityRate:      0.5,
+		MediumPriorityRate:    0.2,
+		RepairThresholdRatio:  0.2,
+		MinRepairThickness:    2.0,
+		ModelResetCoolDown:    200 * time.Millisecond,
+	}
+
+	cm := NewCorrosionMonitor(cfg)
+
+	baseTime := time.Now()
+
+	initialData := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  8.0,
+		InspectionDate:        baseTime,
+		Environment:           models.EnviroIndustrial,
+	}
+	cm.ProcessInspectionData(initialData)
+
+	firstRepair := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  11.0,
+		InspectionDate:        baseTime.Add(10 * time.Millisecond),
+		Environment:           models.EnviroIndustrial,
+	}
+	cm.ProcessInspectionData(firstRepair)
+
+	cm.mu.RLock()
+	firstResetCount := cm.resetCount
+	cm.mu.RUnlock()
+
+	secondRepair := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  11.8,
+		InspectionDate:        baseTime.Add(50 * time.Millisecond),
+		Environment:           models.EnviroIndustrial,
+	}
+	cm.ProcessInspectionData(secondRepair)
+
+	cm.mu.RLock()
+	secondResetCount := cm.resetCount
+	cm.mu.RUnlock()
+
+	if secondResetCount != firstResetCount {
+		t.Error("冷却期内不应重复重置模型")
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	thirdRepair := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  12.0,
+		InspectionDate:        baseTime.Add(300 * time.Millisecond),
+		Environment:           models.EnviroIndustrial,
+	}
+	cm.ProcessInspectionData(thirdRepair)
+
+	cm.mu.RLock()
+	thirdResetCount := cm.resetCount
+	cm.mu.RUnlock()
+
+	if thirdResetCount <= secondResetCount {
+		t.Error("冷却期后应允许模型重置")
+	}
+
+	t.Logf("模型重置冷却期验证成功 - 重置次数: 第一次:%d, 冷却期内:%d, 冷却后:%d",
+		firstResetCount, secondResetCount, thirdResetCount)
+}
+
+func TestSmallThicknessGainIgnored(t *testing.T) {
+	cfg := &config.CorrosionMonitorConfig{
+		MinWallThickness:      4.0,
+		CriticalWallThickness: 6.0,
+		PredictionHorizonMonths: 60,
+		ReplacementThreshold:  0.6,
+		HighPriorityRate:      0.5,
+		MediumPriorityRate:    0.2,
+		RepairThresholdRatio:  0.2,
+		MinRepairThickness:    2.0,
+	}
+
+	cm := NewCorrosionMonitor(cfg)
+
+	baseTime := time.Now()
+
+	data1 := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  8.0,
+		InspectionDate:        baseTime,
+		Environment:           models.EnviroIndustrial,
+	}
+	cm.ProcessInspectionData(data1)
+
+	smallGainData := &models.PipeCorrosionData{
+		PipeID:                "PIPE-001",
+		Position:              100,
+		OriginalWallThickness: 12.0,
+		CurrentWallThickness:  8.1,
+		InspectionDate:        baseTime.AddDate(0, 1, 0),
+		Environment:           models.EnviroIndustrial,
+	}
+
+	detected := cm.detectRepairEvent(smallGainData)
+	if detected {
+		t.Error("小幅壁厚增益不应触发修复检测")
+	}
+
+	cm.mu.RLock()
+	model := cm.pipeModels["PIPE-001"]
+	cm.mu.RUnlock()
+
+	if model.IsReset {
+		t.Error("小幅增益不应触发模型重置")
+	}
+
+	t.Log("小幅壁厚增益忽略验证成功")
+}

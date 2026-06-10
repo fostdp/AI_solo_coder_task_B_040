@@ -28,6 +28,12 @@ type CalorificControl struct {
 	wobbeHistory    map[string][]*models.WobbeIndex
 	valveStates     map[string]float64
 	lastControlTime map[string]time.Time
+	lastAdjustments map[string]float64
+	lastDeviations  []float64
+
+	oscillationCount int64
+	feedForwardCount int64
+	rateLimitedCount int64
 
 	stats         ControlStats
 	statsMu       sync.Mutex
@@ -63,6 +69,8 @@ func NewCalorificControl(cfg *config.CalorificControlConfig) *CalorificControl {
 		wobbeHistory:    make(map[string][]*models.WobbeIndex),
 		valveStates:     make(map[string]float64),
 		lastControlTime: make(map[string]time.Time),
+		lastAdjustments: make(map[string]float64),
+		lastDeviations:  make([]float64, 0, 10),
 		stats:           ControlStats{},
 	}
 }
@@ -142,11 +150,14 @@ func (cc *CalorificControl) ProcessCompositionData(data *models.GasComposition) 
 		services.WebSocket.Broadcast("wobbe_update", wobbe)
 	}
 
+	rateOfChange := cc.calculateRateOfChange(data)
+	feedForward := cc.calculateFeedForward(data)
+
 	if math.Abs(wobbe.Deviation) > cc.cfg.WobbeTolerance {
 		cc.statsMu.Lock()
 		cc.stats.OutOfTolerance++
 		cc.statsMu.Unlock()
-		cc.adjustValves(wobbe)
+		cc.adjustValves(wobbe, rateOfChange, feedForward)
 	} else {
 		cc.statsMu.Lock()
 		cc.stats.WithinTolerance++
@@ -311,14 +322,155 @@ func (cc *CalorificControl) saveWobbeIndex(wobbe *models.WobbeIndex) {
 	}
 }
 
-func (cc *CalorificControl) adjustValves(wobbe *models.WobbeIndex) {
+func (cc *CalorificControl) calculateRateOfChange(data *models.GasComposition) float64 {
+	cc.mu.RLock()
+	history, exists := cc.compositionData[data.DeviceID]
+	cc.mu.RUnlock()
+
+	if !exists || len(history) < 2 {
+		return 0
+	}
+
+	last := history[len(history)-1]
+	prev := history[len(history)-2]
+
+	dt := data.Timestamp.Sub(prev.Timestamp).Seconds()
+	if dt <= 0 {
+		return 0
+	}
+
+	totalChange := 0.0
+	totalChange += math.Abs(data.Methane - prev.Methane)
+	totalChange += math.Abs(data.Hydrogen - prev.Hydrogen)
+	totalChange += math.Abs(data.Nitrogen - prev.Nitrogen)
+
+	return totalChange / dt
+}
+
+func (cc *CalorificControl) calculateFeedForward(data *models.GasComposition) float64 {
+	cc.mu.RLock()
+	history, exists := cc.compositionData[data.DeviceID]
+	cc.mu.RUnlock()
+
+	if !exists || len(history) < 3 {
+		return 0
+	}
+
+	last := history[len(history)-1]
+	prev := history[len(history)-2]
+
+	hydrogenChange := data.Hydrogen - last.Hydrogen
+	nitrogenChange := data.Nitrogen - last.Nitrogen
+
+	feedForward := 0.0
+	if cc.cfg.FeedForwardGain > 0 {
+		feedForward += hydrogenChange * 0.15 * cc.cfg.FeedForwardGain
+		feedForward -= nitrogenChange * 0.10 * cc.cfg.FeedForwardGain
+	}
+
+	if math.Abs(feedForward) > 0 {
+		cc.mu.Lock()
+		cc.feedForwardCount++
+		cc.mu.Unlock()
+	}
+
+	return feedForward
+}
+
+func (cc *CalorificControl) detectOscillation() bool {
+	cc.mu.RLock()
+	deviations := cc.lastDeviations
+	cc.mu.RUnlock()
+
+	if len(deviations) < 4 {
+		return false
+	}
+
+	signChanges := 0
+	for i := 1; i < len(deviations); i++ {
+		if (deviations[i] > 0 && deviations[i-1] < 0) ||
+			(deviations[i] < 0 && deviations[i-1] > 0) {
+			signChanges++
+		}
+	}
+
+	threshold := 2
+	if cc.cfg.OscillationThreshold > 0 {
+		threshold = int(cc.cfg.OscillationThreshold)
+	}
+
+	if signChanges >= threshold {
+		cc.mu.Lock()
+		cc.oscillationCount++
+		cc.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+func (cc *CalorificControl) limitRateOfChange(adjustment float64, valveID string) float64 {
+	cc.mu.RLock()
+	lastAdj, exists := cc.lastAdjustments[valveID]
+	cc.mu.RUnlock()
+
+	if !exists {
+		return adjustment
+	}
+
+	maxRate := cc.cfg.MaxRateOfChange
+	if maxRate <= 0 {
+		maxRate = 5.0
+	}
+
+	maxChange := maxRate * cc.cfg.ValveCooldown.Seconds()
+	maxChange = math.Max(0.5, maxChange)
+
+	rateLimited := adjustment
+	if adjustment > lastAdj + maxChange {
+		rateLimited = lastAdj + maxChange
+	} else if adjustment < lastAdj - maxChange {
+		rateLimited = lastAdj - maxChange
+	}
+
+	if rateLimited != adjustment {
+		cc.mu.Lock()
+		cc.rateLimitedCount++
+		cc.mu.Unlock()
+		log.Printf("[CalorificControl] 变化率限制 - 阀门%s: 原调节%.1f→限制后%.1f, 最大变化%.1f",
+			valveID, adjustment, rateLimited, maxChange)
+	}
+
+	return rateLimited
+}
+
+func (cc *CalorificControl) getAdaptiveSmoothingCount() int {
+	if cc.detectOscillation() {
+		return 10
+	}
+	if cc.cfg.AdaptiveSmoothing > 0 {
+		return cc.cfg.AdaptiveSmoothing
+	}
+	return 5
+}
+
+func (cc *CalorificControl) adjustValves(wobbe *models.WobbeIndex, rateOfChange float64, feedForward float64) {
 	deviation := wobbe.Deviation
 	targetWobbe := cc.cfg.TargetWobbeIndex
 
-	avgWobbe := cc.calculateAverageWobbe(wobbe.DeviceID, 5)
+	cc.mu.Lock()
+	cc.lastDeviations = append(cc.lastDeviations, deviation)
+	if len(cc.lastDeviations) > 10 {
+		cc.lastDeviations = cc.lastDeviations[1:]
+	}
+	cc.mu.Unlock()
+
+	smoothingCount := cc.getAdaptiveSmoothingCount()
+	avgWobbe := cc.calculateAverageWobbe(wobbe.DeviceID, smoothingCount)
 	smoothedDeviation := avgWobbe - targetWobbe
 
 	adjustment := cc.calculatePIDAdjustment(smoothedDeviation)
+	adjustment += feedForward
+
 	if math.Abs(adjustment) < 0.5 {
 		return
 	}
@@ -334,6 +486,8 @@ func (cc *CalorificControl) adjustValves(wobbe *models.WobbeIndex) {
 		log.Printf("[CalorificControl] 阀门%s处于冷却期，跳过调节", sourceValve)
 		return
 	}
+
+	adjustment = cc.limitRateOfChange(adjustment, sourceValve)
 
 	cc.mu.Lock()
 	currentOpening := cc.valveStates[sourceValve]
@@ -369,6 +523,7 @@ func (cc *CalorificControl) adjustValves(wobbe *models.WobbeIndex) {
 	cc.mu.Lock()
 	cc.valveStates[sourceValve] = targetOpening
 	cc.lastControlTime[sourceValve] = time.Now()
+	cc.lastAdjustments[sourceValve] = adjustment
 	cc.mu.Unlock()
 
 	cc.statsMu.Lock()

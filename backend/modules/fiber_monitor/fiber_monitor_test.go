@@ -575,3 +575,270 @@ func TestMonitorLifecycle(t *testing.T) {
 
 	cancel()
 }
+
+func TestFiberBreakpointDetection(t *testing.T) {
+	cfg := &config.FiberMonitorConfig{
+		SpatialResolution:          1.0,
+		StrainWarningThreshold:    200,
+		StrainAlarmThreshold:      500,
+		TemperatureWarningThreshold: 40,
+		TemperatureAlarmThreshold:   60,
+		BrillouinCoefficient:     0.05,
+		StrainJumpThreshold:      300,
+		BrillouinJumpThreshold:   5,
+		DataGapTimeout:           2 * time.Second,
+	}
+
+	fm := NewFiberMonitor(cfg)
+
+	baseTime := time.Now()
+
+	data1 := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      100,
+		Timestamp:     baseTime,
+		Strain:        100,
+		Temperature:   25,
+		BrillouinShift: 5,
+		Status:        "valid",
+	}
+	fm.ProcessFiberData(data1)
+
+	data2 := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      100,
+		Timestamp:     baseTime.Add(100 * time.Millisecond),
+		Strain:        150,
+		Temperature:   25,
+		BrillouinShift: 7.5,
+		Status:        "valid",
+	}
+	fm.ProcessFiberData(data2)
+
+	breakData := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      100,
+		Timestamp:     baseTime.Add(200 * time.Millisecond),
+		Strain:        800,
+		Temperature:   25,
+		BrillouinShift: 0.1,
+		Status:        "valid",
+	}
+	fm.ProcessFiberData(breakData)
+
+	fm.mu.RLock()
+	breakpoints, exists := fm.breakpoints["FIBER-001"]
+	fm.mu.RUnlock()
+
+	if !exists || len(breakpoints) == 0 {
+		t.Fatal("应检测到光纤断点，但未检测到")
+	}
+
+	bp := breakpoints[len(breakpoints)-1]
+	if bp.Type != "fiber_break" && bp.Type != "strain_discontinuity" && bp.Type != "brillouin_discontinuity" {
+		t.Errorf("断点类型错误: %s", bp.Type)
+	}
+
+	if bp.Confidence < 0.7 {
+		t.Errorf("断点置信度过低: %.2f", bp.Confidence)
+	}
+
+	if bp.Position != 100 {
+		t.Errorf("断点位置错误: %.1f", bp.Position)
+	}
+
+	t.Logf("断点检测成功 - 类型:%s, 置信度:%.0f%%, 位置:%.1fm",
+		bp.Type, bp.Confidence*100, bp.Position)
+}
+
+func TestDataInterpolationOnBreak(t *testing.T) {
+	cfg := &config.FiberMonitorConfig{
+		SpatialResolution:          1.0,
+		StrainWarningThreshold:    200,
+		StrainAlarmThreshold:      500,
+		TemperatureWarningThreshold: 40,
+		TemperatureAlarmThreshold:   60,
+		BrillouinCoefficient:     0.05,
+		MaxInterpolationDistance: 50,
+		StrainJumpThreshold:      300,
+	}
+
+	fm := NewFiberMonitor(cfg)
+
+	baseTime := time.Now()
+
+	for i := 0; i < 5; i++ {
+		data := &models.FiberOpticData{
+			DeviceID:      "FIBER-001",
+			Position:      100 + float64(i)*10,
+			Timestamp:     baseTime.Add(time.Duration(i) * 100 * time.Millisecond),
+			Strain:        100 + float64(i)*10,
+			Temperature:   25,
+			BrillouinShift: 5 + float64(i)*0.5,
+			Status:        "valid",
+		}
+		fm.ProcessFiberData(data)
+	}
+
+	brokenData := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      150,
+		Timestamp:     baseTime.Add(500 * time.Millisecond),
+		Strain:        0,
+		Temperature:   0,
+		BrillouinShift: 0,
+		Status:        "invalid",
+	}
+
+	interpolated := fm.interpolateMissingData(brokenData)
+	if interpolated == nil {
+		t.Fatal("数据中断时应生成插值数据，但返回nil")
+	}
+
+	if interpolated.Status != "interpolated" {
+		t.Errorf("插值数据状态错误: %s", interpolated.Status)
+	}
+
+	if interpolated.Strain < 100 || interpolated.Strain > 200 {
+		t.Errorf("插值应变超出合理范围: %.1f", interpolated.Strain)
+	}
+
+	if interpolated.Temperature < 20 || interpolated.Temperature > 30 {
+		t.Errorf("插值温度超出合理范围: %.1f", interpolated.Temperature)
+	}
+
+	if interpolated.BrillouinShift < 4 || interpolated.BrillouinShift > 10 {
+		t.Errorf("插值布里渊频移超出合理范围: %.1f", interpolated.BrillouinShift)
+	}
+
+	fm.mu.RLock()
+	initialCount := fm.interpolatedCount
+	fm.mu.RUnlock()
+
+	fm.ProcessFiberData(brokenData)
+
+	fm.mu.RLock()
+	finalCount := fm.interpolatedCount
+	fm.mu.RUnlock()
+
+	if finalCount != initialCount+1 {
+		t.Errorf("插值计数未增加: %d -> %d", initialCount, finalCount)
+	}
+
+	t.Logf("数据插值成功 - 原始应变:%.1f → 插值应变:%.1f, 插值计数:%d",
+		brokenData.Strain, interpolated.Strain, finalCount)
+}
+
+func TestInterpolationDistanceLimit(t *testing.T) {
+	cfg := &config.FiberMonitorConfig{
+		SpatialResolution:          1.0,
+		StrainWarningThreshold:    200,
+		StrainAlarmThreshold:      500,
+		TemperatureWarningThreshold: 40,
+		TemperatureAlarmThreshold:   60,
+		BrillouinCoefficient:     0.05,
+		MaxInterpolationDistance: 20,
+	}
+
+	fm := NewFiberMonitor(cfg)
+
+	baseTime := time.Now()
+
+	data1 := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      100,
+		Timestamp:     baseTime,
+		Strain:        100,
+		Temperature:   25,
+		BrillouinShift: 5,
+		Status:        "valid",
+	}
+	fm.ProcessFiberData(data1)
+
+	farData := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      200,
+		Timestamp:     baseTime.Add(100 * time.Millisecond),
+		Strain:        0,
+		Temperature:   0,
+		BrillouinShift: 0,
+		Status:        "invalid",
+	}
+
+	interpolated := fm.interpolateMissingData(farData)
+	if interpolated != nil {
+		t.Error("距离超出限制时不应插值，但返回了插值数据")
+	}
+
+	nearData := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      110,
+		Timestamp:     baseTime.Add(100 * time.Millisecond),
+		Strain:        0,
+		Temperature:   0,
+		BrillouinShift: 0,
+		Status:        "invalid",
+	}
+
+	interpolated = fm.interpolateMissingData(nearData)
+	if interpolated == nil {
+		t.Error("距离在限制内应插值，但返回nil")
+	}
+
+	t.Log("插值距离限制验证成功")
+}
+
+func TestDataGapTimeoutDetection(t *testing.T) {
+	cfg := &config.FiberMonitorConfig{
+		SpatialResolution:          1.0,
+		StrainWarningThreshold:    200,
+		StrainAlarmThreshold:      500,
+		TemperatureWarningThreshold: 40,
+		TemperatureAlarmThreshold:   60,
+		BrillouinCoefficient:     0.05,
+		DataGapTimeout:           50 * time.Millisecond,
+	}
+
+	fm := NewFiberMonitor(cfg)
+
+	baseTime := time.Now()
+
+	data1 := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      100,
+		Timestamp:     baseTime,
+		Strain:        100,
+		Temperature:   25,
+		BrillouinShift: 5,
+		Status:        "valid",
+	}
+	fm.ProcessFiberData(data1)
+
+	time.Sleep(60 * time.Millisecond)
+
+	data2 := &models.FiberOpticData{
+		DeviceID:      "FIBER-001",
+		Position:      100,
+		Timestamp:     baseTime.Add(60 * time.Millisecond),
+		Strain:        120,
+		Temperature:   25,
+		BrillouinShift: 6,
+		Status:        "valid",
+	}
+	fm.ProcessFiberData(data2)
+
+	fm.mu.RLock()
+	breakpoints, exists := fm.breakpoints["FIBER-001"]
+	fm.mu.RUnlock()
+
+	if !exists || len(breakpoints) == 0 {
+		t.Fatal("数据超时间隔应触发断点检测，但未检测到")
+	}
+
+	bp := breakpoints[len(breakpoints)-1]
+	if bp.Type != "data_interruption" {
+		t.Errorf("断点类型应为data_interruption，但为: %s", bp.Type)
+	}
+
+	t.Logf("数据中断检测成功 - 类型:%s, 置信度:%.0f%%", bp.Type, bp.Confidence*100)
+}
